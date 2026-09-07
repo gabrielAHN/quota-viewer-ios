@@ -3080,13 +3080,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return nil
     }
 
-    // Every live `claude` process (with a session id) = a present session; busy
-    // reflects its transcript's exact turn state (see claudeTurnActive), falling
-    // back to file freshness if the transcript tail can't be read.
+    // Every live `claude` process = a present session; busy reflects its
+    // transcript's exact turn state (see claudeTurnActive), falling back to file
+    // freshness. The session id comes from the command line when present
+    // (--session-id/--resume); a headless launch that carries neither — e.g.
+    // Hermes Desktop runs `claude --output-format stream-json` — is resolved by
+    // the transcript the live process holds OPEN (lsof), so those sessions light
+    // the pet too instead of being invisible.
     private static func claudeSessions(now: Date) -> [LocalSession] {
+        // pid + command per process, so we can both read session flags and lsof the
+        // pids that carry none.
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/ps")
-        proc.arguments = ["-axo", "command="]
+        proc.arguments = ["-axo", "pid=,command="]
         let out = Pipe()
         proc.standardOutput = out
         proc.standardError = FileHandle.nullDevice
@@ -3098,36 +3104,85 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let nonSession: Set<String> = ["login", "logout", "mcp", "config", "doctor",
                                        "update", "upgrade", "install", "migrate-installer",
                                        "--version", "-v", "--help", "-h"]
-        var ids: [String] = []
+        let projects = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
+        let dirs = (try? FileManager.default.contentsOfDirectory(at: projects, includingPropertiesForKeys: nil)) ?? []
+        // id -> its transcript (nil until resolved). Deduped by id so the same
+        // session found via a flag AND via lsof isn't counted twice.
+        var transcriptByID: [String: URL] = [:]
+        var flagIDs = Set<String>()
+        var headlessPIDs: [Int32] = []
         for raw in text.split(separator: "\n") {
-            let tokens = raw.split(separator: " ").map(String.init)
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard let sp = line.firstIndex(of: " ") else { continue }
+            let pid = Int32(line[..<sp]) ?? -1
+            let command = line[line.index(after: sp)...]
+            let tokens = command.split(separator: " ").map(String.init)
             guard let first = tokens.first,
                   (first as NSString).lastPathComponent == "claude" else { continue }
             if tokens.count > 1, nonSession.contains(tokens[1]) { continue }
-            guard let id = flagValue("--session-id", in: tokens) ?? flagValue("--resume", in: tokens) else { continue }
-            ids.append(id)
+            if let id = flagValue("--session-id", in: tokens) ?? flagValue("--resume", in: tokens) {
+                flagIDs.insert(id)
+            } else if pid > 0 {
+                headlessPIDs.append(pid)
+            }
         }
-        guard !ids.isEmpty else { return [] }
-
-        let projects = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
-        let dirs = (try? FileManager.default.contentsOfDirectory(at: projects, includingPropertiesForKeys: nil)) ?? []
-        let hex = providerHex("anthropic")
-        return ids.map { id in
-            var transcript: URL?
-            var age = Double.greatestFiniteMagnitude
+        // Flag-id sessions: locate their transcript by filename (existing behaviour).
+        for id in flagIDs {
             for dir in dirs {
                 let candidate = dir.appendingPathComponent("\(id).jsonl")
-                if let modified = (try? FileManager.default.attributesOfItem(atPath: candidate.path))?[.modificationDate] as? Date {
-                    transcript = candidate
-                    age = now.timeIntervalSince(modified)
+                if FileManager.default.fileExists(atPath: candidate.path) {
+                    transcriptByID[id] = candidate
                     break
                 }
+            }
+        }
+        // Headless sessions: the id is the transcript the process holds open.
+        for url in openClaudeTranscripts(pids: headlessPIDs) {
+            let id = url.deletingPathExtension().lastPathComponent
+            if transcriptByID[id] == nil { transcriptByID[id] = url }
+        }
+        // Include flag ids that resolved to no transcript too (a just-started session).
+        let ids = Set(transcriptByID.keys).union(flagIDs)
+        guard !ids.isEmpty else { return [] }
+
+        let hex = providerHex("anthropic")
+        return ids.map { id in
+            let transcript = transcriptByID[id]
+            var age = Double.greatestFiniteMagnitude
+            if let transcript,
+               let modified = (try? FileManager.default.attributesOfItem(atPath: transcript.path))?[.modificationDate] as? Date {
+                age = now.timeIntervalSince(modified)
             }
             // Prefer the exact turn state (no lag); fall back to freshness only if
             // the transcript tail can't be parsed.
             let busy = transcript.flatMap { claudeTurnActive($0) } ?? (age < localBusyWindow)
             return LocalSession(key: "local:claude:\(id)", hex: hex, busy: busy, order: 0)
         }
+    }
+
+    // Transcripts (~/.claude/projects/**/<id>.jsonl) currently held OPEN by the
+    // given pids — one lsof call resolves a headless `claude` session's id without
+    // a command-line flag. Empty pids → no call.
+    private static func openClaudeTranscripts(pids: [Int32]) -> [URL] {
+        guard !pids.isEmpty else { return [] }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        proc.arguments = ["-nP", "-Fn", "-p", pids.map(String.init).joined(separator: ",")]
+        let out = Pipe()
+        proc.standardOutput = out
+        proc.standardError = FileHandle.nullDevice
+        do { try proc.run() } catch { return [] }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        guard let text = String(data: data, encoding: .utf8) else { return [] }
+        var urls: [URL] = []
+        var seen = Set<String>()
+        for line in text.split(separator: "\n") where line.hasPrefix("n") {
+            let path = String(line.dropFirst())
+            guard path.contains("/.claude/projects/"), path.hasSuffix(".jsonl") else { continue }
+            if seen.insert(path).inserted { urls.append(URL(fileURLWithPath: path)) }
+        }
+        return urls
     }
 
     // Codex has no per-session process to watch, so use its rollout freshness:
@@ -3159,8 +3214,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private static func flagValue(_ flag: String, in tokens: [String]) -> String? {
-        guard let index = tokens.firstIndex(of: flag), index + 1 < tokens.count else { return nil }
-        return tokens[index + 1]
+        // "--flag value"
+        if let index = tokens.firstIndex(of: flag), index + 1 < tokens.count {
+            return tokens[index + 1]
+        }
+        // "--flag=value" — how headless launches pass the id (Hermes Desktop runs
+        // `claude … --resume=<id>` / `--session-id=<id>`), which the space form missed.
+        let prefix = flag + "="
+        if let token = tokens.first(where: { $0.hasPrefix(prefix) }) {
+            let value = String(token.dropFirst(prefix.count))
+            return value.isEmpty ? nil : value
+        }
+        return nil
     }
 
     // opencode has no long-lived per-session process to watch, so read its local
