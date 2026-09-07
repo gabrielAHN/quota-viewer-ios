@@ -179,6 +179,66 @@ def get_json(path):
         return None
 
 
+def _spawned_local_backend_get_json():
+    """A get_json bound to the LOCAL `hermes serve` backend the Desktop spawned, if
+    one is running — INDEPENDENT of which connection is the Desktop's PRIMARY. A
+    Desktop chat runs on that local backend (source: desktop), so the Hermes pet has
+    to read it even when the primary connection is a REMOTE gateway whose
+    /api/sessions never lists this machine's desktop sessions. The backend's REST
+    token is not on disk — Electron mints it in memory and hands it to `serve` as
+    HERMES_DASHBOARD_SESSION_TOKEN — so resolve everything live: backend pid (from
+    backend-ownership.json) -> its listening loopback port (lsof; serve runs with
+    --port 0) -> the token from that process's OWN environment. Returns None when no
+    local backend is running or its port/token can't be resolved. This is the macOS
+    path (ps eww / lsof over our own uid); a client with only a remote gateway and no
+    local spawn simply gets None and nothing changes."""
+    import re
+    own = read_json("backend-ownership.json") or {}
+    for backend in own.get("backends") or []:
+        pid = backend.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            continue
+        base = (backend.get("url") or backend.get("baseUrl") or "").rstrip("/")
+        if not base:
+            port = backend.get("port")
+            if not port:
+                try:
+                    listing = subprocess.run(
+                        ["/usr/sbin/lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", str(pid)],
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3,
+                    ).stdout.decode("utf-8", "replace")
+                    m = re.search(r"127\.0\.0\.1:(\d+)", listing)
+                    port = m.group(1) if m else None
+                except Exception:
+                    port = None
+            if not port:
+                continue
+            base = "http://127.0.0.1:%s" % port
+        token = None
+        try:
+            env = subprocess.run(
+                ["ps", "eww", "-p", str(pid)],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3,
+            ).stdout.decode("utf-8", "replace")
+            m = re.search(r"HERMES_DASHBOARD_SESSION_TOKEN=(\S+)", env)
+            token = m.group(1) if m else None
+        except Exception:
+            token = None
+        headers = {"Accept": "*/*"}
+        if token:
+            headers["X-Hermes-Session-Token"] = token
+        def _get(path, _base=base, _headers=headers):
+            status, body = http_get(_base + path, _headers)
+            if status != 200:
+                return None
+            try:
+                return json.loads(body)
+            except Exception:
+                return None
+        return _get
+    return None
+
+
 # --- Activity mode: resolve the gateway ONCE, then fetch /api/status plus each
 # profile's recent sessions in the same process, and emit a compact summary the
 # menu-bar uses to light the Hermes pet. Bot turns run as `source: cli` sessions
@@ -234,15 +294,44 @@ if ENDPOINT == "--activity":
     # store (/api/sessions) carries a human-readable `last_activity_description` per
     # session — e.g. "tool running: clarify" while an agent is asking YOU to clarify.
     # Join by session_id to detect the WAITING-FOR-YOU states without a gateway change.
+    # Collect sessions from the PRIMARY connection AND — always — the local
+    # `hermes serve` backend the Desktop spawned, if any. Desktop chats run on that
+    # local backend (source: desktop); when the primary connection is a REMOTE
+    # gateway its /api/sessions never lists them, so without this merge the Hermes
+    # pet is blind to the very sessions you start from the app. Dedup by session id
+    # so a backend that is BOTH the primary and the local spawn isn't counted twice.
     store_by_id = {}
-    try:
-        _sess = _soft(get_json)("/api/sessions") or {}
-        for _s in (_sess.get("sessions") or []):
+    merged_sessions = []
+    _seen_sids = set()
+
+    def _ingest(container):
+        if not isinstance(container, dict):
+            return
+        for _s in (container.get("sessions") or []):
             _sid = _s.get("session_id") or _s.get("id")
+            key = str(_sid) if _sid else ("obj:%d" % id(_s))
+            if key in _seen_sids:
+                continue
+            _seen_sids.add(key)
+            merged_sessions.append(_s)
             if _sid:
                 store_by_id[str(_sid)] = _s
+
+    try:
+        _ingest(_soft(get_json)("/api/sessions"))
+        _local_get = _spawned_local_backend_get_json()
+        if _local_get is not None:
+            _ingest(_soft(_local_get)("/api/sessions"))
+            # If the primary's plugin /activity came back empty (typical when the
+            # primary is a remote gateway but the live sessions are local), let the
+            # local backend's /activity be the fallback list too.
+            if not (act.get("sessions") if isinstance(act, dict) else None):
+                _local_act = _soft(_local_get)("/api/plugins/provider-quota/activity")
+                if isinstance(_local_act, dict) and _local_act.get("sessions"):
+                    act = _local_act
     except Exception:
         pass
+    _sess = {"sessions": merged_sessions}
 
     def _store(sess):
         return store_by_id.get(str(sess.get("session_id") or ""), {})
