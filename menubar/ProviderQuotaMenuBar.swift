@@ -2756,15 +2756,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             func visibleMark(_ hex: String, needsInput: Bool = false, needsPermission: Bool = false) -> SessionMark? {
                 let attention = needsInput || needsPermission
                 let busy = !attention   // waiting sessions aren't generating
-                // Out-of-quota / disconnected colours drop from EVERY mark (running
-                // or attention) — that provider isn't really doing work.
-                var kept = hex.split(separator: ",").map(String.init)
-                    .filter { !exhaustedColors.contains($0.lowercased()) }
-                // Hidden colours drop from RUNNING dots only; an attention mark still
-                // shows so a hidden provider's prompt isn't lost.
-                if !attention {
-                    kept = kept.filter { !hiddenColors.contains($0.lowercased()) }
+                // A session that NEEDS YOU (input/permission) ALWAYS shows — even for a
+                // hidden or out-of-quota provider — so you never miss a prompt; it's a
+                // live session awaiting you, not idle work. Only RUNNING dots are
+                // filtered: drop a colour that's out of quota / disconnected (no real
+                // work) or hidden via the eye.
+                guard !attention else {
+                    return SessionMark(hex: hex, busy: busy, needsInput: needsInput, needsPermission: needsPermission)
                 }
+                let kept = hex.split(separator: ",").map(String.init)
+                    .filter { !exhaustedColors.contains($0.lowercased()) && !hiddenColors.contains($0.lowercased()) }
                 return kept.isEmpty ? nil : SessionMark(hex: kept.joined(separator: ","), busy: busy, needsInput: needsInput, needsPermission: needsPermission)
             }
 
