@@ -19,6 +19,7 @@ SUPPORT = Path.home() / "Library/Application Support/Hermes"
 # body is written to stdout.
 ENDPOINT = sys.argv[1] if len(sys.argv) > 1 else "/api/plugins/provider-quota/quotas?refresh=true"
 OUT = sys.argv[2] if len(sys.argv) > 2 else None
+ACTIVITY = ENDPOINT == "--activity"
 # Activity polls run on the menu-bar's 1s timer and only read session lists, so a
 # slow gateway call must fail FAST — a 20s hang would stall the in-flight guard
 # and make a session's dot appear (or clear) many seconds late. Quota fetches hit
@@ -27,8 +28,18 @@ TIMEOUT = 6 if ENDPOINT == "--activity" else 20
 
 
 def fail(msg):
+    # In --activity mode a broken PRIMARY connection (signed out, expired token,
+    # unreachable) must NOT kill the whole scan — the local Desktop-spawned backend
+    # is read separately and still has live sessions. Raise a catchable error there;
+    # only quota/single-endpoint mode exits hard.
+    if ACTIVITY:
+        raise _PrimaryUnavailable(msg)
     sys.stderr.write(msg.rstrip() + "\n")
     sys.exit(1)
+
+
+class _PrimaryUnavailable(Exception):
+    pass
 
 
 def emit(data):
@@ -73,103 +84,113 @@ def http_get(url, headers):
 
 
 # --- Which gateway is the Desktop bound to? Prefer the primary entry in the v2
-# connections.json, fall back to the legacy connection.json. ---
-conns = read_json("connections.json") or {}
-primary = None
-if isinstance(conns.get("connections"), list) and conns["connections"]:
-    by_id = {c.get("id"): c for c in conns["connections"]}
-    primary = by_id.get(conns.get("primary")) or conns["connections"][0]
+# connections.json, fall back to the legacy connection.json. Wrapped so that in
+# --activity mode a broken/absent primary doesn't abort — fetch stays None and the
+# scan proceeds with the local Desktop-spawned backend only. ---
+fetch = None
+EXPIRED_MSG = "Hermes gateway returned HTTP %s."
+try:
+    conns = read_json("connections.json") or {}
+    primary = None
+    if isinstance(conns.get("connections"), list) and conns["connections"]:
+        by_id = {c.get("id"): c for c in conns["connections"]}
+        primary = by_id.get(conns.get("primary")) or conns["connections"][0]
 
-if primary is not None:
-    kind = primary.get("kind")
-    url = (primary.get("url") or "").rstrip("/")
-else:
-    legacy = read_json("connection.json") or {}
-    kind = legacy.get("mode")
-    url = ""
-    if kind and kind != "local":
-        url = ((legacy.get(kind) or legacy.get("remote") or {}).get("url") or "").rstrip("/")
-
-if not kind:
-    fail("Hermes Desktop is not set up.")
-
-def _norm(value):
-    return value.strip().strip("/")
-
-
-# --- Build a `fetch(path) -> (status, body)` bound to the gateway the Desktop is
-# bound to: a loopback bind (local mode) needs no auth; a remote gateway uses the
-# Desktop's OAuth session. Resolving this once lets one process serve several
-# endpoints (see --activity) with a single Keychain read / token decrypt. ---
-if kind == "local":
-    own = read_json("backend-ownership.json") or {}
-    local_url = None
-    for backend in own.get("backends") or []:
-        candidate = (backend.get("url") or backend.get("baseUrl") or "").rstrip("/")
-        if candidate:
-            local_url = candidate
-            break
-        port = backend.get("port")
-        if port:
-            local_url = "http://127.0.0.1:%s" % port
-            break
-    if not local_url:
-        fail("Hermes Desktop is in local mode but no local gateway is running.")
-
-    def fetch(path):
-        return http_get(local_url + path, {"Accept": "*/*"})
-
-    EXPIRED_MSG = "Local Hermes gateway returned HTTP %s."
-else:
-    if not url:
-        fail("Hermes Desktop has no gateway configured.")
-    tokens = read_json("native-oauth-tokens.json")
-    if tokens is None:
-        fail("Sign in to Hermes Desktop.")
-    entry = tokens.get(url) or next((v for k, v in tokens.items() if _norm(k) == _norm(url)), None)
-    if not entry:
-        fail("Sign in to Hermes Desktop (%s)." % url)
-
-    value = entry.get("value") or ""
-    if entry.get("encoding") == "safeStorage":
-        # Electron safeStorage v10: AES-128-CBC, key = PBKDF2-HMAC-SHA1(secret,
-        # "saltysalt", 1003, 16), IV = 16 spaces. Decrypt with openssl to avoid a
-        # python crypto dependency.
-        try:
-            secret = subprocess.check_output(
-                ["security", "find-generic-password", "-s", "Hermes Safe Storage", "-w"],
-                stderr=subprocess.DEVNULL,
-            ).decode().strip()
-        except Exception as exc:
-            fail("Cannot read 'Hermes Safe Storage' Keychain key: %s" % exc)
-        key = hashlib.pbkdf2_hmac("sha1", secret.encode(), b"saltysalt", 1003, dklen=16)
-        raw = base64.b64decode(value)
-        if raw[:3] != b"v10":
-            fail("Unexpected Hermes Desktop token format.")
-        proc = subprocess.run(
-            ["openssl", "enc", "-d", "-aes-128-cbc", "-K", key.hex(),
-             "-iv", "20" * 16, "-nopad"],
-            input=raw[3:], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        )
-        plaintext = proc.stdout
-        if not plaintext:
-            fail("Cannot decrypt Hermes Desktop session token (openssl).")
-        plaintext = plaintext[: -plaintext[-1]]  # strip PKCS7 padding
-        session = json.loads(plaintext.decode())
+    if primary is not None:
+        kind = primary.get("kind")
+        url = (primary.get("url") or "").rstrip("/")
     else:
-        session = json.loads(value)
+        legacy = read_json("connection.json") or {}
+        kind = legacy.get("mode")
+        url = ""
+        if kind and kind != "local":
+            url = ((legacy.get(kind) or legacy.get("remote") or {}).get("url") or "").rstrip("/")
 
-    access_token = session.get("accessToken") or ""
-    if not access_token:
-        fail("Sign in to Hermes Desktop.")
+    if not kind:
+        fail("Hermes Desktop is not set up.")
 
-    def fetch(path):
-        return http_get(url + path, {"Authorization": "Bearer " + access_token, "Accept": "*/*"})
+    def _norm(value):
+        return value.strip().strip("/")
 
-    EXPIRED_MSG = "Hermes gateway returned HTTP %s."
+    # --- Build a `fetch(path) -> (status, body)` bound to the gateway the Desktop is
+    # bound to: a loopback bind (local mode) needs no auth; a remote gateway uses the
+    # Desktop's OAuth session. Resolving this once lets one process serve several
+    # endpoints (see --activity) with a single Keychain read / token decrypt. ---
+    if kind == "local":
+        own = read_json("backend-ownership.json") or {}
+        local_url = None
+        for backend in own.get("backends") or []:
+            candidate = (backend.get("url") or backend.get("baseUrl") or "").rstrip("/")
+            if candidate:
+                local_url = candidate
+                break
+            port = backend.get("port")
+            if port:
+                local_url = "http://127.0.0.1:%s" % port
+                break
+        if not local_url:
+            fail("Hermes Desktop is in local mode but no local gateway is running.")
+
+        def fetch(path):
+            return http_get(local_url + path, {"Accept": "*/*"})
+
+        EXPIRED_MSG = "Local Hermes gateway returned HTTP %s."
+    else:
+        if not url:
+            fail("Hermes Desktop has no gateway configured.")
+        tokens = read_json("native-oauth-tokens.json")
+        if tokens is None:
+            fail("Sign in to Hermes Desktop.")
+        entry = tokens.get(url) or next((v for k, v in tokens.items() if _norm(k) == _norm(url)), None)
+        if not entry:
+            fail("Sign in to Hermes Desktop (%s)." % url)
+
+        value = entry.get("value") or ""
+        if entry.get("encoding") == "safeStorage":
+            # Electron safeStorage v10: AES-128-CBC, key = PBKDF2-HMAC-SHA1(secret,
+            # "saltysalt", 1003, 16), IV = 16 spaces. Decrypt with openssl to avoid a
+            # python crypto dependency.
+            try:
+                secret = subprocess.check_output(
+                    ["security", "find-generic-password", "-s", "Hermes Safe Storage", "-w"],
+                    stderr=subprocess.DEVNULL,
+                ).decode().strip()
+            except Exception as exc:
+                fail("Cannot read 'Hermes Safe Storage' Keychain key: %s" % exc)
+            key = hashlib.pbkdf2_hmac("sha1", secret.encode(), b"saltysalt", 1003, dklen=16)
+            raw = base64.b64decode(value)
+            if raw[:3] != b"v10":
+                fail("Unexpected Hermes Desktop token format.")
+            proc = subprocess.run(
+                ["openssl", "enc", "-d", "-aes-128-cbc", "-K", key.hex(),
+                 "-iv", "20" * 16, "-nopad"],
+                input=raw[3:], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+            plaintext = proc.stdout
+            if not plaintext:
+                fail("Cannot decrypt Hermes Desktop session token (openssl).")
+            plaintext = plaintext[: -plaintext[-1]]  # strip PKCS7 padding
+            session = json.loads(plaintext.decode())
+        else:
+            session = json.loads(value)
+
+        access_token = session.get("accessToken") or ""
+        if not access_token:
+            fail("Sign in to Hermes Desktop.")
+
+        def fetch(path, _url=url, _tok=access_token):
+            return http_get(_url + path, {"Authorization": "Bearer " + _tok, "Accept": "*/*"})
+
+        EXPIRED_MSG = "Hermes gateway returned HTTP %s."
+except _PrimaryUnavailable:
+    # --activity only: primary is signed out / unreachable. Leave fetch=None; the
+    # local-backend read below still lights the pet for local Desktop sessions.
+    fetch = None
 
 
 def get_json(path):
+    if fetch is None:
+        return None
     status, body = fetch(path)
     if status != 200:
         return None
@@ -410,20 +431,17 @@ if ENDPOINT == "--activity":
                 return "permission"
         return ""
 
-    # The gateway's is_active flag is UNRELIABLE — it stays False for sessions that
-    # are plainly running: a cli/tool/desktop turn mid-API-call, or one blocked
-    # waiting on a slow provider ("waiting on <model> — 115s with no output yet").
-    # So drive the pet from the session STORE (/api/sessions): a session is LIVE when
-    # it's still OPEN (ended_at is None) AND working (is_active, or its activity
-    # description shows work) or needs you. Ended sessions never dot (that honours
-    # "only active"). Fall back to the /activity is_active list if the store is down.
-    _WORKING = ("starting api call", "api call", "receiving stream", "streaming",
-                "waiting on", "executing tool", "generating", "thinking",
-                "responding", "reasoning", "running")
-    # A session must have done SOMETHING within this window to count as running.
-    # This is what rejects LEAKED sessions — ones left open (ended_at never set) for
-    # days, frozen at "starting API call #1" (api_call_count 0), which otherwise
-    # matched a working phrase and showed a phantom dot.
+    # A session is LIVE when it's still OPEN (ended_at is None) AND the gateway's
+    # is_active flag says a turn is running. is_active is AUTHORITATIVE: the gateway
+    # keeps it True for the whole turn (even a long Desktop generation that doesn't
+    # bump last_active) and flips it False the INSTANT the turn completes or is
+    # stopped. So we must NOT resurrect a finished-but-open session from a stale
+    # "receiving stream response" description — that's the "pet stayed active after
+    # the turn finished" bug. Ended sessions never dot (honours "only active").
+    #
+    # Only when the gateway OMITS is_active entirely (older/partial store rows) do we
+    # fall back to a freshness gate: recent activity within _FRESH, which also
+    # rejects LEAKED sessions left open for days frozen at "starting API call #1".
     _FRESH = 120.0
     now = time.time()
 
@@ -435,18 +453,13 @@ if ENDPOINT == "--activity":
         return 0.0
 
     def _live(sess):
-        # is_active is trustworthy when TRUE — it flips False the instant a turn ends
-        # — so honour it directly. When False it's unreliable (a running turn can read
-        # False), so fall back to "working per description AND recent activity". The
-        # recency gate is what keeps days-old leaked sessions from lighting the pet.
-        if sess.get("is_active"):
-            return True
+        ia = sess.get("is_active")
+        if isinstance(ia, bool):
+            return ia                       # authoritative — trust it, True or False
+        # is_active absent: fall back to plain recency (and never resurrect a leaked
+        # days-old session).
         la = _last_activity(sess)
-        if not la or (now - la) > _FRESH:
-            return False
-        d = str(sess.get("last_activity_description")
-                or _store(sess).get("last_activity_description") or "").lower()
-        return any(p in d for p in _WORKING) or bool(_attention(sess))
+        return bool(la) and (now - la) <= _FRESH
 
     store_list = _sess.get("sessions") if isinstance(_sess, dict) else None
     if store_list:
@@ -474,7 +487,11 @@ if ENDPOINT == "--activity":
             fam = _dot_provider({"model": src.get("model"), "billing_provider": src.get("billing_provider")}) or _dot_provider(s)
             families = [fam] if fam else []
         out.append({
-            "is_active": True,   # we already filtered to genuinely-live sessions
+            # Pass through the gateway's REAL is_active (default True only when the
+            # store omits it — those rows were admitted via the freshness fallback),
+            # so the app keeps is_active as its authoritative liveness signal and its
+            # own zombie/ended-grace backstops still apply.
+            "is_active": s.get("is_active") if isinstance(s.get("is_active"), bool) else True,
             "ended_at": s.get("ended_at"),
             "last_active": _last_activity(s) or now,
             "billing_provider": _dot_provider({"model": src.get("model"), "billing_provider": src.get("billing_provider")}) or _dot_provider(s),
