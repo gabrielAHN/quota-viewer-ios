@@ -247,8 +247,7 @@ def _spawned_local_backend_get_json():
 # app decide what's "running". Never fails: a signed-out gateway just yields an
 # empty summary so the pet quietly stays idle. ---
 if ENDPOINT == "--activity":
-    import re, time
-    from concurrent.futures import ThreadPoolExecutor
+    import time
 
     def _dot_provider(s):
         # Colour the pet's dot by the MODEL FAMILY the user reasons about — Claude

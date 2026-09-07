@@ -324,10 +324,6 @@ struct PetTile: Equatable {
     // Which source this pet belongs to (GatewayKind rawValue), so a right-click
     // "Turn Off" can disable the right source's pet. Empty for placeholders.
     var sourceKey: String = ""
-    // Provider colours (lowercased hex) in this source that are OUT OF QUOTA /
-    // disconnected — a session point in one of these gets the red alert ring,
-    // matching the header/menu dots.
-    var alertHexes: Set<String> = []
 }
 
 enum PetCatalog {
@@ -792,14 +788,13 @@ final class ActivityPetsView: NSView {
             let padX: CGFloat = 2         // capsule padding — a tight circle around one dot
             let capH: CGFloat = 10        // capsule height — hug the dots so the glow sits close
             let cy = tileRect.minY + 10   // clear of the bottom edge so the (bigger) glow isn't clipped
-            var groups: [(colors: [(NSColor, String)], busy: Bool, needsInput: Bool, needsPermission: Bool)] = []
+            var groups: [(colors: [NSColor], busy: Bool, needsInput: Bool, needsPermission: Bool)] = []
             var total = 0
             for mark in tile.sessions {
-                var pairs = mark.hex.split(separator: ",").compactMap { part -> (NSColor, String)? in
-                    let h = String(part).lowercased()
-                    return NSColor(activityHex: h).map { ($0, h) }
+                var pairs = mark.hex.split(separator: ",").compactMap { part -> NSColor? in
+                    NSColor(activityHex: String(part).lowercased())
                 }
-                if pairs.isEmpty { pairs = [(.hermesBlue, "")] }
+                if pairs.isEmpty { pairs = [.hermesBlue] }
                 if !groups.isEmpty && total + pairs.count > 7 { break }
                 groups.append((pairs, mark.busy, mark.needsInput, mark.needsPermission))
                 total += pairs.count
@@ -877,25 +872,8 @@ final class ActivityPetsView: NSView {
                 // that pulses + enlarges on the beat — one glowing dot for a single model,
                 // two adjacent glowing dots (each its colour) for a multi-model session.
                 var dx = cx0 + padX
-                for (color, hex) in group.colors {
+                for color in group.colors {
                     let dotRect = NSRect(x: dx, y: cy - dotSize / 2, width: dotSize, height: dotSize)
-                    if tile.alertHexes.contains(hex) {
-                        // OUT OF QUOTA / disconnected: a red "buffer" ring around a
-                        // smaller dot — the SAME alert as the header/menu dots (no
-                        // white outline, no glow).
-                        color.setFill()
-                        NSBezierPath(ovalIn: dotRect.insetBy(dx: 0.75, dy: 0.75)).fill()
-                        let ring = NSBezierPath(ovalIn: dotRect.insetBy(dx: -1, dy: -1))
-                        NSColor.hermesRed.setStroke()
-                        ring.lineWidth = 1.4
-                        ring.stroke()
-                        // Still flag "needs you" even when the provider is out of
-                        // quota (the red ring stays; add the attention badge).
-                        if group.needsPermission { drawPermissionBadge(dotRect) }
-                        else if group.needsInput { drawInputBadge(dotRect) }
-                        dx += dotSize + innerGap
-                        continue
-                    }
                     if group.busy {
                         color.withAlphaComponent(0.22).setFill()
                         NSBezierPath(ovalIn: dotRect.insetBy(dx: -2.5 - g, dy: -2.5 - g)).fill()
@@ -2718,23 +2696,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 continue
             }
 
-            // Providers the user hid via the eye toggle shouldn't show a pet dot
-            // either — drop any dot whose colour belongs to a hidden provider, and
-            // drop a whole session mark when every one of its models is hidden.
-            let hiddenColors = Set((sources.first { $0.kind == kind }?.providers ?? [])
+            // Providers the user hid via the eye toggle, and providers that are OUT
+            // OF QUOTA or disconnected, must not light a running dot. A hidden
+            // provider still shows an ATTENTION dot (so you never miss a prompt); an
+            // out-of-quota / disconnected provider shows NOTHING — an exhausted or
+            // offline provider has no live session worth a point.
+            let sourceProviders = sources.first { $0.kind == kind }?.providers ?? []
+            let hiddenColors = Set(sourceProviders
                 .filter { !providerShownInMenuBar(kind, $0.provider) }
+                .map { Self.providerHex($0.provider).lowercased() })
+            let exhaustedColors = Set(sourceProviders
+                .filter { providerRingColor($0, connected: connected) != nil }
                 .map { Self.providerHex($0.provider).lowercased() })
             func visibleMark(_ hex: String, needsInput: Bool = false, needsPermission: Bool = false) -> SessionMark? {
                 let attention = needsInput || needsPermission
                 let busy = !attention   // waiting sessions aren't generating
-                // A session that NEEDS YOU (input/permission) always shows — even for a
-                // provider you've hidden — so you never miss it. Running dots still
-                // respect the eye-toggle hiding.
-                guard !attention, !hiddenColors.isEmpty else {
-                    return SessionMark(hex: hex, busy: busy, needsInput: needsInput, needsPermission: needsPermission)
+                // Out-of-quota / disconnected colours drop from EVERY mark (running
+                // or attention) — that provider isn't really doing work.
+                var kept = hex.split(separator: ",").map(String.init)
+                    .filter { !exhaustedColors.contains($0.lowercased()) }
+                // Hidden colours drop from RUNNING dots only; an attention mark still
+                // shows so a hidden provider's prompt isn't lost.
+                if !attention {
+                    kept = kept.filter { !hiddenColors.contains($0.lowercased()) }
                 }
-                let kept = hex.split(separator: ",").map(String.init)
-                    .filter { !hiddenColors.contains($0.lowercased()) }
                 return kept.isEmpty ? nil : SessionMark(hex: kept.joined(separator: ","), busy: busy, needsInput: needsInput, needsPermission: needsPermission)
             }
 
@@ -2760,12 +2745,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 working = !marks.isEmpty
             }
 
-            // Provider colours that are out of quota (or disconnected) — a session
-            // point in one of these gets the red alert ring, matching the header.
-            let alertHexes = Set((sources.first { $0.kind == kind }?.providers ?? [])
-                .filter { providerRingColor($0, connected: connected) != nil }
-                .map { Self.providerHex($0.provider).lowercased() })
-
             // A session waiting for you (input OR permission) makes the pet WAVE for
             // attention (the non-error "waiting" animation), taking priority over the
             // plain working/idle state. Otherwise it moves while working and sits idle.
@@ -2788,7 +2767,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } else {
                 display = Self.idleSourceInstance(name: sourceName(kind))
             }
-            tiles.append(PetTile(instance: display, pet: pet, sessionCount: max(marks.count, 1), sessions: marks, sourceKey: kind.rawValue, alertHexes: alertHexes))
+            tiles.append(PetTile(instance: display, pet: pet, sessionCount: max(marks.count, 1), sessions: marks, sourceKey: kind.rawValue))
         }
         return tiles
     }
