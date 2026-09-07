@@ -145,7 +145,11 @@ def anthropic_provider():
         util = window.get("utilization")
         if util is None:
             continue
-        used = float(util) * 100 if float(util) <= 1 else float(util)
+        # The OAuth usage API reports `utilization` as a PERCENT (0-100), e.g. 34.0
+        # or 2.0 — never a 0-1 fraction. Take it as-is (clamped). The old "if <= 1,
+        # multiply by 100" fraction guess inverted a barely-used window into a full
+        # one — a fresh session at 1% utilization became 100% used → "no quota".
+        used = max(0.0, min(100.0, float(util)))
         windows.append(_window(wlabel, used, resets_at=window.get("resets_at")))
     details = []
     extra = payload.get("extra_usage") or {}
