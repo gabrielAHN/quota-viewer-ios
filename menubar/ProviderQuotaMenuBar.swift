@@ -1371,8 +1371,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         view.addSubview(label(recovered ? "Quota back · \(summaryText)" : summaryText, frame: NSRect(x: 56, y: 7, width: 260, height: 15), font: .systemFont(ofSize: 10.5), color: recovered ? .hermesGreen : menuSecondaryColor()))
         // Bar tracks the collapsed %: the current-session window for %-based
         // providers (Codex/Claude); amount-only providers (OpenRouter) keep their
-        // existing bar via the min fallback.
-        if connected, provider.status == "ok",
+        // existing bar via the min fallback. An OUT-OF-QUOTA provider draws NO bar
+        // (a 0%-full bar is just noise) — the summary carries its reset time
+        // instead, the same treatment as the expanded window rows.
+        if connected, provider.status == "ok", !providerIsExhausted(provider),
            let minimum = collapsedRemainingPercent(provider) {
             let track = NSView(frame: NSRect(x: 232, y: 11, width: 104, height: 6))
             track.wantsLayer = true
@@ -1797,12 +1799,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let reached = provider.windows.filter(\.limitReached)
         if !reached.isEmpty {
             // Out of quota (yellow ring). Reset FIRST (so it never gets truncated off
-            // the row) — that reset time IS the thing to wait for. When there's no
-            // reset, credit-based providers just need a top-up, so say so.
-            if let soonest = reached.compactMap({ parsedDate($0.resetsAt) }).filter({ $0 > Date() }).min() {
-                let formatter = RelativeDateTimeFormatter()
-                formatter.unitsStyle = .short
-                return "Resets \(formatter.localizedString(for: soonest, relativeTo: Date())) · over limit"
+            // the row) — that reset time IS the thing to wait for, shown as a PRECISE
+            // countdown ("in 2h 15m") to match the expanded window rows. When there's
+            // no reset, credit-based providers just need a top-up, so say so.
+            let soonest = reached
+                .compactMap { w -> (String, Date)? in parsedDate(w.resetsAt).map { (w.resetsAt ?? "", $0) } }
+                .filter { $0.1 > Date() }
+                .min { $0.1 < $1.1 }
+            if let soonest, let precise = preciseCountdown(soonest.0) {
+                return "Resets in \(precise) · over limit"
             }
             if ["openrouter", "opencode"].contains(Self.normalizedProvider(provider.provider)) {
                 return "Over limit · add credits"
