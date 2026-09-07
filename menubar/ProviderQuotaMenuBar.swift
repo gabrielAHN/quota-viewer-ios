@@ -679,6 +679,7 @@ final class ActivityPetsView: NSView {
         switch instance.status {
         case "error", "failed": state = "Not working"
         case "waiting":         state = "Needs attention"
+        case "recovered":       state = "Quota back"
         case "completed":       state = "Done"
         case "sleeping":        state = "Idle"
         default:                state = "Working"
@@ -721,6 +722,7 @@ final class ActivityPetsView: NSView {
             switch instance.status {
             case "working":            row = 7   // running → actively working
             case "waiting":            row = 3   // needs your input → WAVE for attention
+            case "recovered":          row = 3   // quota just reset → WAVE to celebrate
             case "error", "failed":    row = 5   // failed → in trouble
             case "completed":
                 // celebrate (jump) briefly, then settle back to idle
@@ -761,6 +763,7 @@ final class ActivityPetsView: NSView {
         let rowFrames = tile.pet.flatMap { frameCounts[$0.id] } ?? []
         let working = instance.status == "working"
         let failed = instance.failed
+        let recovered = instance.status == "recovered"
         // Pet sits in the upper part; the bottom ~14pt is a dedicated dots row.
         let petRect = NSRect(x: tileRect.minX + 2, y: tileRect.minY + 16, width: 52, height: 56.3)
         let halo = NSBezierPath(ovalIn: NSRect(x: petRect.minX + 4, y: petRect.minY + 5, width: petRect.width - 8, height: petRect.height - 10))
@@ -768,9 +771,9 @@ final class ActivityPetsView: NSView {
         // "waiting" (needs-your-input) deliberately keeps the NORMAL halo — the pet
         // signals input only by WAVING (drawNukey row 3), never with a pet badge/tint;
         // the input badge lives on the session point instead.
-        let haloColor: NSColor = failed ? .hermesRed : instance.completed ? .hermesGreen : working ? .hermesBlue : .hermesBlue
+        let haloColor: NSColor = failed ? .hermesRed : (instance.completed || recovered) ? .hermesGreen : .hermesBlue
         let haloPulse = CGFloat((sin(Double(phase) * .pi / 6) + 1) * 0.035)
-        haloColor.withAlphaComponent((working || failed ? 0.17 : 0.09) + haloPulse).setFill()
+        haloColor.withAlphaComponent((working || failed || recovered ? 0.17 : 0.09) + haloPulse).setFill()
         halo.fill()
         drawNukey(instance, image: sheet, thumbnail: thumb, rowFrames: rowFrames, in: petRect)
 
@@ -1105,6 +1108,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Providers whose detail is expanded (collapsed by default → brief row with a
     // bar; click to expand for per-window info). Session-scoped.
     private var expandedProviders = Set<String>()
+    // Provider keys observed OUT OF QUOTA on the latest connected reading — so a
+    // later reading that has quota again is recognised as a RESET (its window
+    // rolled over), not a first sighting. Only connected+ok readings mutate this.
+    private var exhaustedProviderKeys = Set<String>()
+    // When a provider's quota last came BACK (exhausted → has quota). Drives the
+    // brief "quota back" celebration: a green reset icon on its row + the source's
+    // pet WAVING. Cleared implicitly once older than `quotaRecoveryCelebration`.
+    private var quotaRecoveredAt: [String: Date] = [:]
+    private static let quotaRecoveryCelebration: TimeInterval = 8
     // Whether the Sources selector is expanded to show its per-source checkboxes.
     private var sourcesExpanded = false
     // Last provider slug→label from a successful fetch, PER source, so a
@@ -1260,14 +1272,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func titleView() -> NSView {
-        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 68))
-        view.addSubview(label("Provider Quotas", frame: NSRect(x: 16, y: 39, width: 230, height: 20), font: .systemFont(ofSize: 15, weight: .semibold), color: menuPrimaryColor()))
-        let connection = connectionSummary()
-        view.addSubview(label(connection, frame: NSRect(x: 16, y: 20, width: 300, height: 17), font: .systemFont(ofSize: 11, weight: .medium), color: anyConnected ? .hermesGreen : .hermesRed))
+        // Only surface the source-connection line when it's ACTIONABLE — a source is
+        // down, needs sign-in, or nothing is enabled. When everything's connected the
+        // "Hermes connected · Local connected" line was just noise, so drop it and
+        // tighten the header. (Per-source headers below still carry each source's state.)
+        let allConnected = !enabledGateways().isEmpty
+            && enabledGateways().allSatisfy { kind in sources.first { $0.kind == kind }?.connected ?? false }
+        let showConnection = !allConnected
+        let height: CGFloat = showConnection ? 68 : 50
+        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: height))
+        view.addSubview(label("Provider Quotas", frame: NSRect(x: 16, y: showConnection ? 39 : 26, width: 230, height: 20), font: .systemFont(ofSize: 15, weight: .semibold), color: menuPrimaryColor()))
+        if showConnection {
+            view.addSubview(label(connectionSummary(), frame: NSRect(x: 16, y: 20, width: 300, height: 17), font: .systemFont(ofSize: 11, weight: .medium), color: anyConnected ? .hermesGreen : .hermesRed))
+        }
         let generatedAt = sources.compactMap { $0.generatedAt }.first
         let updated = formattedRelativeDate(generatedAt).map { "Updated \($0)" } ?? "Provider quotas"
-        view.addSubview(label(updated, frame: NSRect(x: 16, y: 4, width: 300, height: 16), font: .systemFont(ofSize: 10.5), color: menuSecondaryColor()))
-        let image = NSImageView(frame: NSRect(x: 320, y: 28, width: 22, height: 22))
+        view.addSubview(label(updated, frame: NSRect(x: 16, y: showConnection ? 4 : 6, width: 300, height: 16), font: .systemFont(ofSize: 10.5), color: menuSecondaryColor()))
+        let image = NSImageView(frame: NSRect(x: 320, y: showConnection ? 28 : 16, width: 22, height: 22))
         image.image = NSImage(systemSymbolName: "gauge.with.dots.needle.50percent", accessibilityDescription: "Quotas")
         image.contentTintColor = .hermesBlue
         view.addSubview(image)
@@ -1353,13 +1374,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let plan = provider.plan {
             view.addSubview(label(plan.uppercased(), frame: NSRect(x: 200, y: 28, width: 90, height: 15), font: .systemFont(ofSize: 9, weight: .medium), color: menuTertiaryColor(), alignment: .right))
         }
-        let statusImage = NSImageView(frame: NSRect(x: 322, y: 27, width: 14, height: 14))
-        statusImage.image = providerDotImage(provider, size: 14, connected: connected)
+        // A provider that just RESET swaps its status dot for a green reset icon and
+        // leads its summary with "Quota back" for a few seconds (the pet waves too).
+        let recovered = providerRecentlyRecovered(key)
+        let statusImage = NSImageView(frame: NSRect(x: recovered ? 320 : 322, y: 26, width: recovered ? 17 : 14, height: recovered ? 17 : 14))
+        if recovered {
+            statusImage.image = NSImage(systemSymbolName: "arrow.clockwise.circle.fill", accessibilityDescription: "Quota reset — available again")
+            statusImage.contentTintColor = .hermesGreen
+            statusImage.imageScaling = .scaleProportionallyDown
+        } else {
+            statusImage.image = providerDotImage(provider, size: 14, connected: connected)
+        }
         view.addSubview(statusImage)
         // Brief line: summary text + an overall provider-coloured bar. Same font
         // and colour regardless of status (out of quota / offline included) so the
         // provider info always reads the same; the status dot conveys any problem.
-        view.addSubview(label(providerSummary(provider, connected: connected), frame: NSRect(x: 56, y: 7, width: 170, height: 15), font: .systemFont(ofSize: 10.5), color: menuSecondaryColor()))
+        let summaryText = providerSummary(provider, connected: connected)
+        view.addSubview(label(recovered ? "Quota back · \(summaryText)" : summaryText, frame: NSRect(x: 56, y: 7, width: 260, height: 15), font: .systemFont(ofSize: 10.5), color: recovered ? .hermesGreen : menuSecondaryColor()))
         // Bar tracks the collapsed %: the current-session window for %-based
         // providers (Codex/Claude); amount-only providers (OpenRouter) keep their
         // existing bar via the min fallback.
@@ -1593,6 +1624,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func providerIsExhausted(_ provider: QuotaProvider) -> Bool {
         provider.status == "ok" && provider.windows.contains(where: \.limitReached)
+    }
+
+    // After each fetch, diff every connected+ok provider's exhaustion against the
+    // last reading. A provider that WAS out of quota and now has some again just
+    // reset — stamp it so its row and pet briefly celebrate. Disconnected / non-ok
+    // readings are ignored (a source dropping offline isn't a reset), so a reset
+    // that happens while a source is briefly down is still caught on reconnect.
+    private func noteQuotaTransitions() {
+        for source in sources where source.connected {
+            for provider in source.providers where provider.status == "ok" {
+                let key = providerKey(source.kind, provider.provider)
+                if providerIsExhausted(provider) {
+                    exhaustedProviderKeys.insert(key)
+                } else if exhaustedProviderKeys.remove(key) != nil {
+                    quotaRecoveredAt[key] = Date()
+                }
+            }
+        }
+    }
+
+    // True while a provider is inside its post-reset celebration window.
+    private func providerRecentlyRecovered(_ key: String) -> Bool {
+        guard let at = quotaRecoveredAt[key] else { return false }
+        return Date().timeIntervalSince(at) < Self.quotaRecoveryCelebration
+    }
+
+    // Labels of a source's providers still inside their celebration window — the
+    // pet waves and names them while any is present.
+    private func recoveredProviderLabels(_ kind: GatewayKind) -> [String] {
+        (sources.first { $0.kind == kind }?.providers ?? []).compactMap { p in
+            providerRecentlyRecovered(providerKey(kind, p.provider)) ? p.label : nil
+        }
     }
 
     private func formattedAmount(_ amount: Double, currency: String?) -> String {
@@ -2453,6 +2516,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 case .failure:
                     self.upsertSource(SourceQuota(kind: kind, providers: self.disconnectedProviders(for: kind), connected: false, generatedAt: nil))
                 }
+                self.noteQuotaTransitions()   // catch any provider that just reset
                 self.updateStatusItem()
                 self.rebuildMenu()
                 self.updateActivityPets()
@@ -2707,12 +2771,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // plain working/idle state. Otherwise it moves while working and sits idle.
             let needsPermission = marks.contains { $0.needsPermission }
             let needsAttention = needsPermission || marks.contains { $0.needsInput }
+            let recovered = recoveredProviderLabels(kind)
             let display: ProviderActivityInstance
             if needsAttention {
                 let n = marks.filter { $0.needsInput || $0.needsPermission }.count
                 let noun = needsPermission ? "permission" : "input"
                 display = Self.waitingSourceInstance(name: sourceName(kind),
                     title: "\(n) session\(n == 1 ? "" : "s") need\(n == 1 ? "s" : "") your \(noun)")
+            } else if !recovered.isEmpty {
+                // A provider just reset — WAVE to celebrate that quota's back.
+                let names = recovered.joined(separator: ", ")
+                display = Self.celebrateSourceInstance(name: sourceName(kind),
+                    title: "\(names) quota back")
             } else if working {
                 display = Self.workingSourceInstance(name: sourceName(kind), title: title)
             } else {
@@ -2930,6 +3000,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             provider: "source", providerColor: "#db704b", providerLabel: "",
             sessionId: "", startedAt: Date().timeIntervalSince1970,
             status: "waiting", title: title)
+    }
+
+    // A source whose provider just got its quota back (window reset): a happy WAVE
+    // (drawNukey row 3) with a GREEN halo — "you're good to go again" — distinct
+    // from the orange input-wait wave and the red failed state.
+    private static func celebrateSourceInstance(name: String, title: String) -> ProviderActivityInstance {
+        ProviderActivityInstance(
+            completedAt: nil, key: "\(name):recovered", model: "", profile: name,
+            provider: "source", providerColor: "#43c46b", providerLabel: "",
+            sessionId: "", startedAt: Date().timeIntervalSince1970,
+            status: "recovered", title: title)
     }
 
     // Seconds since a session's log was last written before we treat it as idle.
@@ -3221,6 +3302,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 // Keep only sources still enabled at completion — a source disabled
                 // while this fetch was in flight must not reappear (the toggle-off lag).
                 self.sources = built.filter { self.gatewayEnabled($0.kind) }
+                self.noteQuotaTransitions()   // catch any provider that just reset
                 self.activating.removeAll()   // data landed → clear the spinners
                 self.updateStatusItem()
                 self.rebuildMenu()

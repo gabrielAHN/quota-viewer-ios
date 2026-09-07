@@ -125,8 +125,12 @@ def _anthropic_direct(label: str) -> dict[str, Any] | None:
         util = window.get("utilization")
         if util is None:
             continue
-        used = float(util) * 100 if float(util) <= 1 else float(util)
-        used = max(0.0, min(100.0, used))
+        # `utilization` from the OAuth usage API is a PERCENT (0-100), e.g. 34.0 /
+        # 2.0 — not a 0-1 fraction. Take it as-is (clamped). The old "if <= 1,
+        # multiply by 100" guess inverted a barely-used window into a full one — a
+        # fresh session at 1% utilization became 100% used → "no quota" — and
+        # disagreed with the primary account_usage path, which uses the raw percent.
+        used = max(0.0, min(100.0, float(util)))
         windows.append({
             "label": wlabel,
             "used_percent": used,
