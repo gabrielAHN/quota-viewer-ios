@@ -298,24 +298,50 @@ if ENDPOINT == "--activity":
     # `hermes serve` backend the Desktop spawned, if any. Desktop chats run on that
     # local backend (source: desktop); when the primary connection is a REMOTE
     # gateway its /api/sessions never lists them, so without this merge the Hermes
-    # pet is blind to the very sessions you start from the app. Dedup by session id
-    # so a backend that is BOTH the primary and the local spawn isn't counted twice.
-    store_by_id = {}
-    merged_sessions = []
-    _seen_sids = set()
+    # pet is blind to the very sessions you start from the app.
+    #
+    # A session id can appear in BOTH stores — e.g. a claude-code/imported session
+    # that is LIVE on the local backend but lingers as an ENDED, model-less row on
+    # the remote primary. Dedup must therefore keep the MOST-ALIVE copy per id (open
+    # beats ended; among open, is_active beats idle; then newer last_active wins),
+    # never merely the first one seen — otherwise the primary's dead copy shadows the
+    # local live one and that session (often the Codex/GPT turn) shows no pet point.
+    def _last_active_of(sess):
+        for k in ("last_active", "last_activity_at", "started_at"):
+            v = sess.get(k)
+            if isinstance(v, (int, float)) and v > 0:
+                return float(v)
+        return 0.0
+
+    def _more_alive(new, old):
+        # True when `new` is a livelier representation of the same session than `old`.
+        new_open = new.get("ended_at") is None
+        old_open = old.get("ended_at") is None
+        if new_open != old_open:
+            return new_open
+        if bool(new.get("is_active")) != bool(old.get("is_active")):
+            return bool(new.get("is_active"))
+        return _last_active_of(new) > _last_active_of(old)
+
+    best_by_id = {}
+    order = []          # session ids in first-seen order (stable output)
+    anon = []           # sessions with no id — can't dedup, keep as-is
 
     def _ingest(container):
         if not isinstance(container, dict):
             return
         for _s in (container.get("sessions") or []):
             _sid = _s.get("session_id") or _s.get("id")
-            key = str(_sid) if _sid else ("obj:%d" % id(_s))
-            if key in _seen_sids:
+            if not _sid:
+                anon.append(_s)
                 continue
-            _seen_sids.add(key)
-            merged_sessions.append(_s)
-            if _sid:
-                store_by_id[str(_sid)] = _s
+            _sid = str(_sid)
+            cur = best_by_id.get(_sid)
+            if cur is None:
+                best_by_id[_sid] = _s
+                order.append(_sid)
+            elif _more_alive(_s, cur):
+                best_by_id[_sid] = _s
 
     try:
         _ingest(_soft(get_json)("/api/sessions"))
@@ -331,6 +357,9 @@ if ENDPOINT == "--activity":
                     act = _local_act
     except Exception:
         pass
+
+    merged_sessions = [best_by_id[i] for i in order] + anon
+    store_by_id = {i: best_by_id[i] for i in order}
     _sess = {"sessions": merged_sessions}
 
     def _store(sess):
