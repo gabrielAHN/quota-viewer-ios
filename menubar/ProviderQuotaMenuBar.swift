@@ -1364,18 +1364,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             statusImage.image = providerDotImage(provider, size: 14, connected: connected)
         }
         view.addSubview(statusImage)
-        // Brief line: summary text + an overall provider-coloured bar. Same font
-        // and colour regardless of status (out of quota / offline included) so the
-        // provider info always reads the same; the status dot conveys any problem.
+        // Brief line: summary text + an overall provider-coloured bar. On a just-RESET
+        // provider the green reset icon (above) is the recovery cue — the summary stays
+        // NORMAL wording (no "Quota back ·" prefix, which was long enough to overrun the
+        // bar) so it reads cleanly next to the restored bar, tinted green only while the
+        // celebration lasts. When a bar WILL show, the summary is narrow so it can't
+        // collide with it; an out-of-quota row (no bar) gets the full width for its
+        // longer "Resets in … · over limit" text.
         let summaryText = providerSummary(provider, connected: connected)
-        view.addSubview(label(recovered ? "Quota back · \(summaryText)" : summaryText, frame: NSRect(x: 56, y: 7, width: 260, height: 15), font: .systemFont(ofSize: 10.5), color: recovered ? .hermesGreen : menuSecondaryColor()))
+        let barWillShow = connected && provider.status == "ok" && !providerIsExhausted(provider)
+            && collapsedRemainingPercent(provider) != nil
+        let summaryWidth: CGFloat = barWillShow ? 170 : 260
+        view.addSubview(label(summaryText, frame: NSRect(x: 56, y: 7, width: summaryWidth, height: 15), font: .systemFont(ofSize: 10.5), color: recovered ? .hermesGreen : menuSecondaryColor()))
         // Bar tracks the collapsed %: the current-session window for %-based
         // providers (Codex/Claude); amount-only providers (OpenRouter) keep their
         // existing bar via the min fallback. An OUT-OF-QUOTA provider draws NO bar
         // (a 0%-full bar is just noise) — the summary carries its reset time
         // instead, the same treatment as the expanded window rows.
-        if connected, provider.status == "ok", !providerIsExhausted(provider),
-           let minimum = collapsedRemainingPercent(provider) {
+        if barWillShow, let minimum = collapsedRemainingPercent(provider) {
             let track = NSView(frame: NSRect(x: 232, y: 11, width: 104, height: 6))
             track.wantsLayer = true
             track.layer?.cornerRadius = 3
