@@ -1937,6 +1937,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             displayValue = "Unavailable"
         }
         view.addSubview(label(displayValue, frame: NSRect(x: 190, y: 39, width: 150, height: 19), font: .monospacedDigitSystemFont(ofSize: 12, weight: .semibold), color: valueColor, alignment: .right))
+
+        if window.limitReached {
+            // OUT OF LIMIT: a 0%-full bar carries no information, so drop it. Give
+            // the freed space to what actually matters when a window is blocked —
+            // a PRECISE reset countdown (down to minutes, not the coarse "in 4h"),
+            // and, unless this IS the weekly window, how much WEEKLY quota you still
+            // have, since that's the real ceiling while this window is spent.
+            let resetLine: String
+            if let precise = preciseCountdown(window.resetsAt), let date = parsedDate(window.resetsAt) {
+                resetLine = "Resets in \(precise) · \(date.formatted(date: .abbreviated, time: .shortened))"
+            } else {
+                resetLine = "No reset time reported"
+            }
+            view.addSubview(label(resetLine, frame: NSRect(x: 28, y: 22, width: 312, height: 16), font: .systemFont(ofSize: 11, weight: .medium), color: menuPrimaryColor()))
+            if let weekly = weeklyWindow(provider), weekly.label != window.label, let pct = weekly.remainingPercent {
+                let resetSuffix = preciseCountdown(weekly.resetsAt).map { " · resets in \($0)" } ?? ""
+                let weeklyColor: NSColor = weekly.limitReached ? .hermesRed : (pct <= 15 ? .hermesOrange : menuSecondaryColor())
+                view.addSubview(label("Weekly: \(Int(pct.rounded()))% left\(resetSuffix)", frame: NSRect(x: 28, y: 4, width: 312, height: 16), font: .systemFont(ofSize: 10.5, weight: .medium), color: weeklyColor))
+            }
+            return view
+        }
+
         if window.remainingPercent != nil {
             let track = NSView(frame: NSRect(x: 28, y: 26, width: 312, height: 6))
             track.wantsLayer = true
@@ -1962,6 +1984,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         view.addSubview(label(subtitle, frame: NSRect(x: 28, y: 4, width: 312, height: 17), font: .systemFont(ofSize: 10.5), color: menuSecondaryColor()))
         return view
+    }
+
+    // A precise "2h 15m" / "4d 3h" / "12m" countdown to a reset time — more
+    // detailed than RelativeDateTimeFormatter's coarse "in 2 hours". Nil when the
+    // time is missing, unparseable, or already past.
+    private func preciseCountdown(_ resetsAt: String?) -> String? {
+        guard let date = parsedDate(resetsAt) else { return nil }
+        let secs = Int(date.timeIntervalSinceNow)
+        guard secs > 0 else { return nil }
+        let days = secs / 86400, hours = (secs % 86400) / 3600, mins = (secs % 3600) / 60
+        if days > 0 { return "\(days)d \(hours)h" }
+        if hours > 0 { return "\(hours)h \(mins)m" }
+        return "\(max(1, mins))m"
+    }
+
+    // The provider's weekly window, if it reports one (label mentions "week").
+    private func weeklyWindow(_ provider: QuotaProvider) -> QuotaWindow? {
+        provider.windows.first { $0.label.lowercased().contains("week") }
     }
 
     private func detailView(_ detail: String) -> NSView {
