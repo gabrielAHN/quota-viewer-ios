@@ -277,8 +277,8 @@ if ENDPOINT == "--activity":
             return "permission"
         if st in ("waiting", "awaiting_input", "needs_input", "input_required"):
             return "input"
-        # Else derive from the session store's activity description.
-        d = str(_store(sess).get("last_activity_description") or "").lower()
+        # Else derive from the activity description (the session's own, else the store's).
+        d = str(sess.get("last_activity_description") or _store(sess).get("last_activity_description") or "").lower()
         if any(p in d for p in _PERM_PHRASES):
             return "permission"
         if any(p in d for p in _INPUT_PHRASES):
@@ -293,37 +293,75 @@ if ENDPOINT == "--activity":
                 return "permission"
         return ""
 
-    for s in act.get("sessions") or []:
-        active = bool(s.get("is_active"))
+    # The gateway's is_active flag is UNRELIABLE — it stays False for sessions that
+    # are plainly running: a cli/tool/desktop turn mid-API-call, or one blocked
+    # waiting on a slow provider ("waiting on <model> — 115s with no output yet").
+    # So drive the pet from the session STORE (/api/sessions): a session is LIVE when
+    # it's still OPEN (ended_at is None) AND working (is_active, or its activity
+    # description shows work) or needs you. Ended sessions never dot (that honours
+    # "only active"). Fall back to the /activity is_active list if the store is down.
+    _WORKING = ("starting api call", "api call", "receiving stream", "streaming",
+                "waiting on", "executing tool", "generating", "thinking",
+                "responding", "reasoning", "running")
+    # A session must have done SOMETHING within this window to count as running.
+    # This is what rejects LEAKED sessions — ones left open (ended_at never set) for
+    # days, frozen at "starting API call #1" (api_call_count 0), which otherwise
+    # matched a working phrase and showed a phantom dot.
+    _FRESH = 120.0
+    now = time.time()
+
+    def _last_activity(sess):
+        for k in ("last_active", "last_activity_at", "started_at"):
+            v = sess.get(k)
+            if isinstance(v, (int, float)) and v > 0:
+                return float(v)
+        return 0.0
+
+    def _live(sess):
+        # is_active is trustworthy when TRUE — it flips False the instant a turn ends
+        # — so honour it directly. When False it's unreliable (a running turn can read
+        # False), so fall back to "working per description AND recent activity". The
+        # recency gate is what keeps days-old leaked sessions from lighting the pet.
+        if sess.get("is_active"):
+            return True
+        la = _last_activity(sess)
+        if not la or (now - la) > _FRESH:
+            return False
+        d = str(sess.get("last_activity_description")
+                or _store(sess).get("last_activity_description") or "").lower()
+        return any(p in d for p in _WORKING) or bool(_attention(sess))
+
+    store_list = _sess.get("sessions") if isinstance(_sess, dict) else None
+    if store_list:
+        candidates = [s for s in store_list if s.get("ended_at") is None and _live(s)]
+    else:
+        candidates = [s for s in (act.get("sessions") or []) if s.get("is_active")]
+
+    for s in candidates:
         att = _attention(s)
-        # A session waiting for you counts as ATTENTION, not "busy" — don't let it set
+        # A session waiting for YOU counts as ATTENTION, not "busy" — don't let it set
         # the aggregate busy flag (the pet should wave, not read as working).
-        if active and att == "":
+        if att == "":
             status_busy = True
-        # Colour by the LIVE model. Prefer the AUTHORITATIVE session store's current
-        # `model` (the /activity plugin's model resolution can lag — it reported
-        # anthropic while the live model was codex). Then the plugin's models list,
-        # then billing/provider. A multi-model session still splits into a wedge per
-        # distinct family.
+        # Colour by the LIVE model from the store session (falling back to the joined
+        # store entry, then billing/provider). Multi-model → one wedge per family.
         st = _store(s)
-        if st.get("model") or st.get("models"):
-            model_list = ([st["model"]] if st.get("model") else []) + (st.get("models") or [])
-        else:
-            model_list = s.get("models") or []
+        src = st if (st.get("model") or st.get("models")) else s
+        model_list = ([src["model"]] if src.get("model") else []) + (src.get("models") or [])
         families = []
         for m in model_list:
             fam = _dot_provider({"model": m})
             if fam and fam not in families:
                 families.append(fam)
         if not families:
-            fam = _dot_provider({"model": st.get("model"), "billing_provider": st.get("billing_provider")}) or _dot_provider(s)
+            fam = _dot_provider({"model": src.get("model"), "billing_provider": src.get("billing_provider")}) or _dot_provider(s)
             families = [fam] if fam else []
         out.append({
-            "is_active": active,
+            "is_active": True,   # we already filtered to genuinely-live sessions
             "ended_at": s.get("ended_at"),
-            "last_active": time.time() if active else s.get("last_active"),
-            "billing_provider": _dot_provider({"model": st.get("model"), "billing_provider": st.get("billing_provider")}) or _dot_provider(s),
-            "provider": st.get("provider") or s.get("provider"),
+            "last_active": _last_activity(s) or now,
+            "billing_provider": _dot_provider({"model": src.get("model"), "billing_provider": src.get("billing_provider")}) or _dot_provider(s),
+            "provider": src.get("provider") or s.get("provider"),
             "providers": families,
             "needs_input": att == "input",
             "needs_permission": att == "permission",
