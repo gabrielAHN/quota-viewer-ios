@@ -324,10 +324,6 @@ struct PetTile: Equatable {
     // Which source this pet belongs to (GatewayKind rawValue), so a right-click
     // "Turn Off" can disable the right source's pet. Empty for placeholders.
     var sourceKey: String = ""
-    // Provider colours (lowercased hex) in this source that are OUT OF QUOTA /
-    // disconnected — a session point in one of these gets the red alert ring,
-    // matching the header/menu dots.
-    var alertHexes: Set<String> = []
 }
 
 enum PetCatalog {
@@ -792,14 +788,13 @@ final class ActivityPetsView: NSView {
             let padX: CGFloat = 2         // capsule padding — a tight circle around one dot
             let capH: CGFloat = 10        // capsule height — hug the dots so the glow sits close
             let cy = tileRect.minY + 10   // clear of the bottom edge so the (bigger) glow isn't clipped
-            var groups: [(colors: [(NSColor, String)], busy: Bool, needsInput: Bool, needsPermission: Bool)] = []
+            var groups: [(colors: [NSColor], busy: Bool, needsInput: Bool, needsPermission: Bool)] = []
             var total = 0
             for mark in tile.sessions {
-                var pairs = mark.hex.split(separator: ",").compactMap { part -> (NSColor, String)? in
-                    let h = String(part).lowercased()
-                    return NSColor(activityHex: h).map { ($0, h) }
+                var pairs = mark.hex.split(separator: ",").compactMap { part -> NSColor? in
+                    NSColor(activityHex: String(part).lowercased())
                 }
-                if pairs.isEmpty { pairs = [(.hermesBlue, "")] }
+                if pairs.isEmpty { pairs = [.hermesBlue] }
                 if !groups.isEmpty && total + pairs.count > 7 { break }
                 groups.append((pairs, mark.busy, mark.needsInput, mark.needsPermission))
                 total += pairs.count
@@ -877,25 +872,8 @@ final class ActivityPetsView: NSView {
                 // that pulses + enlarges on the beat — one glowing dot for a single model,
                 // two adjacent glowing dots (each its colour) for a multi-model session.
                 var dx = cx0 + padX
-                for (color, hex) in group.colors {
+                for color in group.colors {
                     let dotRect = NSRect(x: dx, y: cy - dotSize / 2, width: dotSize, height: dotSize)
-                    if tile.alertHexes.contains(hex) {
-                        // OUT OF QUOTA / disconnected: a red "buffer" ring around a
-                        // smaller dot — the SAME alert as the header/menu dots (no
-                        // white outline, no glow).
-                        color.setFill()
-                        NSBezierPath(ovalIn: dotRect.insetBy(dx: 0.75, dy: 0.75)).fill()
-                        let ring = NSBezierPath(ovalIn: dotRect.insetBy(dx: -1, dy: -1))
-                        NSColor.hermesRed.setStroke()
-                        ring.lineWidth = 1.4
-                        ring.stroke()
-                        // Still flag "needs you" even when the provider is out of
-                        // quota (the red ring stays; add the attention badge).
-                        if group.needsPermission { drawPermissionBadge(dotRect) }
-                        else if group.needsInput { drawInputBadge(dotRect) }
-                        dx += dotSize + innerGap
-                        continue
-                    }
                     if group.busy {
                         color.withAlphaComponent(0.22).setFill()
                         NSBezierPath(ovalIn: dotRect.insetBy(dx: -2.5 - g, dy: -2.5 - g)).fill()
@@ -1393,8 +1371,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         view.addSubview(label(recovered ? "Quota back · \(summaryText)" : summaryText, frame: NSRect(x: 56, y: 7, width: 260, height: 15), font: .systemFont(ofSize: 10.5), color: recovered ? .hermesGreen : menuSecondaryColor()))
         // Bar tracks the collapsed %: the current-session window for %-based
         // providers (Codex/Claude); amount-only providers (OpenRouter) keep their
-        // existing bar via the min fallback.
-        if connected, provider.status == "ok",
+        // existing bar via the min fallback. An OUT-OF-QUOTA provider draws NO bar
+        // (a 0%-full bar is just noise) — the summary carries its reset time
+        // instead, the same treatment as the expanded window rows.
+        if connected, provider.status == "ok", !providerIsExhausted(provider),
            let minimum = collapsedRemainingPercent(provider) {
             let track = NSView(frame: NSRect(x: 232, y: 11, width: 104, height: 6))
             track.wantsLayer = true
@@ -1819,12 +1799,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let reached = provider.windows.filter(\.limitReached)
         if !reached.isEmpty {
             // Out of quota (yellow ring). Reset FIRST (so it never gets truncated off
-            // the row) — that reset time IS the thing to wait for. When there's no
-            // reset, credit-based providers just need a top-up, so say so.
-            if let soonest = reached.compactMap({ parsedDate($0.resetsAt) }).filter({ $0 > Date() }).min() {
-                let formatter = RelativeDateTimeFormatter()
-                formatter.unitsStyle = .short
-                return "Resets \(formatter.localizedString(for: soonest, relativeTo: Date())) · over limit"
+            // the row) — that reset time IS the thing to wait for, shown as a PRECISE
+            // countdown ("in 2h 15m") to match the expanded window rows. When there's
+            // no reset, credit-based providers just need a top-up, so say so.
+            let soonest = reached
+                .compactMap { w -> (String, Date)? in parsedDate(w.resetsAt).map { (w.resetsAt ?? "", $0) } }
+                .filter { $0.1 > Date() }
+                .min { $0.1 < $1.1 }
+            if let soonest, let precise = preciseCountdown(soonest.0) {
+                return "Resets in \(precise) · over limit"
             }
             if ["openrouter", "opencode"].contains(Self.normalizedProvider(provider.provider)) {
                 return "Over limit · add credits"
@@ -1959,6 +1942,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             displayValue = "Unavailable"
         }
         view.addSubview(label(displayValue, frame: NSRect(x: 190, y: 39, width: 150, height: 19), font: .monospacedDigitSystemFont(ofSize: 12, weight: .semibold), color: valueColor, alignment: .right))
+
+        if window.limitReached {
+            // OUT OF LIMIT: a 0%-full bar carries no information, so drop it. Give
+            // the freed space to what actually matters when a window is blocked —
+            // a PRECISE reset countdown (down to minutes, not the coarse "in 4h"),
+            // and, unless this IS the weekly window, how much WEEKLY quota you still
+            // have, since that's the real ceiling while this window is spent.
+            let resetLine: String
+            if let precise = preciseCountdown(window.resetsAt), let date = parsedDate(window.resetsAt) {
+                resetLine = "Resets in \(precise) · \(date.formatted(date: .abbreviated, time: .shortened))"
+            } else {
+                resetLine = "No reset time reported"
+            }
+            view.addSubview(label(resetLine, frame: NSRect(x: 28, y: 22, width: 312, height: 16), font: .systemFont(ofSize: 11, weight: .medium), color: menuPrimaryColor()))
+            if let weekly = weeklyWindow(provider), weekly.label != window.label, let pct = weekly.remainingPercent {
+                let resetSuffix = preciseCountdown(weekly.resetsAt).map { " · resets in \($0)" } ?? ""
+                let weeklyColor: NSColor = weekly.limitReached ? .hermesRed : (pct <= 15 ? .hermesOrange : menuSecondaryColor())
+                view.addSubview(label("Weekly: \(Int(pct.rounded()))% left\(resetSuffix)", frame: NSRect(x: 28, y: 4, width: 312, height: 16), font: .systemFont(ofSize: 10.5, weight: .medium), color: weeklyColor))
+            }
+            return view
+        }
+
         if window.remainingPercent != nil {
             let track = NSView(frame: NSRect(x: 28, y: 26, width: 312, height: 6))
             track.wantsLayer = true
@@ -1984,6 +1989,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         view.addSubview(label(subtitle, frame: NSRect(x: 28, y: 4, width: 312, height: 17), font: .systemFont(ofSize: 10.5), color: menuSecondaryColor()))
         return view
+    }
+
+    // A precise "2h 15m" / "4d 3h" / "12m" countdown to a reset time — more
+    // detailed than RelativeDateTimeFormatter's coarse "in 2 hours". Nil when the
+    // time is missing, unparseable, or already past.
+    private func preciseCountdown(_ resetsAt: String?) -> String? {
+        guard let date = parsedDate(resetsAt) else { return nil }
+        let secs = Int(date.timeIntervalSinceNow)
+        guard secs > 0 else { return nil }
+        let days = secs / 86400, hours = (secs % 86400) / 3600, mins = (secs % 3600) / 60
+        if days > 0 { return "\(days)d \(hours)h" }
+        if hours > 0 { return "\(hours)h \(mins)m" }
+        return "\(max(1, mins))m"
+    }
+
+    // The provider's weekly window, if it reports one (label mentions "week").
+    private func weeklyWindow(_ provider: QuotaProvider) -> QuotaWindow? {
+        provider.windows.first { $0.label.lowercased().contains("week") }
     }
 
     private func detailView(_ detail: String) -> NSView {
@@ -2718,23 +2741,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 continue
             }
 
-            // Providers the user hid via the eye toggle shouldn't show a pet dot
-            // either — drop any dot whose colour belongs to a hidden provider, and
-            // drop a whole session mark when every one of its models is hidden.
-            let hiddenColors = Set((sources.first { $0.kind == kind }?.providers ?? [])
+            // Providers the user hid via the eye toggle, and providers that are OUT
+            // OF QUOTA or disconnected, must not light a running dot. A hidden
+            // provider still shows an ATTENTION dot (so you never miss a prompt); an
+            // out-of-quota / disconnected provider shows NOTHING — an exhausted or
+            // offline provider has no live session worth a point.
+            let sourceProviders = sources.first { $0.kind == kind }?.providers ?? []
+            let hiddenColors = Set(sourceProviders
                 .filter { !providerShownInMenuBar(kind, $0.provider) }
+                .map { Self.providerHex($0.provider).lowercased() })
+            let exhaustedColors = Set(sourceProviders
+                .filter { providerRingColor($0, connected: connected) != nil }
                 .map { Self.providerHex($0.provider).lowercased() })
             func visibleMark(_ hex: String, needsInput: Bool = false, needsPermission: Bool = false) -> SessionMark? {
                 let attention = needsInput || needsPermission
                 let busy = !attention   // waiting sessions aren't generating
-                // A session that NEEDS YOU (input/permission) always shows — even for a
-                // provider you've hidden — so you never miss it. Running dots still
-                // respect the eye-toggle hiding.
-                guard !attention, !hiddenColors.isEmpty else {
+                // A session that NEEDS YOU (input/permission) ALWAYS shows — even for a
+                // hidden or out-of-quota provider — so you never miss a prompt; it's a
+                // live session awaiting you, not idle work. Only RUNNING dots are
+                // filtered: drop a colour that's out of quota / disconnected (no real
+                // work) or hidden via the eye.
+                guard !attention else {
                     return SessionMark(hex: hex, busy: busy, needsInput: needsInput, needsPermission: needsPermission)
                 }
                 let kept = hex.split(separator: ",").map(String.init)
-                    .filter { !hiddenColors.contains($0.lowercased()) }
+                    .filter { !exhaustedColors.contains($0.lowercased()) && !hiddenColors.contains($0.lowercased()) }
                 return kept.isEmpty ? nil : SessionMark(hex: kept.joined(separator: ","), busy: busy, needsInput: needsInput, needsPermission: needsPermission)
             }
 
@@ -2760,12 +2791,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 working = !marks.isEmpty
             }
 
-            // Provider colours that are out of quota (or disconnected) — a session
-            // point in one of these gets the red alert ring, matching the header.
-            let alertHexes = Set((sources.first { $0.kind == kind }?.providers ?? [])
-                .filter { providerRingColor($0, connected: connected) != nil }
-                .map { Self.providerHex($0.provider).lowercased() })
-
             // A session waiting for you (input OR permission) makes the pet WAVE for
             // attention (the non-error "waiting" animation), taking priority over the
             // plain working/idle state. Otherwise it moves while working and sits idle.
@@ -2788,7 +2813,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } else {
                 display = Self.idleSourceInstance(name: sourceName(kind))
             }
-            tiles.append(PetTile(instance: display, pet: pet, sessionCount: max(marks.count, 1), sessions: marks, sourceKey: kind.rawValue, alertHexes: alertHexes))
+            tiles.append(PetTile(instance: display, pet: pet, sessionCount: max(marks.count, 1), sessions: marks, sourceKey: kind.rawValue))
         }
         return tiles
     }
@@ -3080,13 +3105,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return nil
     }
 
-    // Every live `claude` process (with a session id) = a present session; busy
-    // reflects its transcript's exact turn state (see claudeTurnActive), falling
-    // back to file freshness if the transcript tail can't be read.
+    // Every live `claude` process = a present session; busy reflects its
+    // transcript's exact turn state (see claudeTurnActive), falling back to file
+    // freshness. The session id comes from the command line when present
+    // (--session-id/--resume); a headless launch that carries neither — e.g.
+    // Hermes Desktop runs `claude --output-format stream-json` — is resolved by
+    // the transcript the live process holds OPEN (lsof), so those sessions light
+    // the pet too instead of being invisible.
     private static func claudeSessions(now: Date) -> [LocalSession] {
+        // pid + command per process, so we can both read session flags and lsof the
+        // pids that carry none.
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/ps")
-        proc.arguments = ["-axo", "command="]
+        proc.arguments = ["-axo", "pid=,command="]
         let out = Pipe()
         proc.standardOutput = out
         proc.standardError = FileHandle.nullDevice
@@ -3098,36 +3129,85 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let nonSession: Set<String> = ["login", "logout", "mcp", "config", "doctor",
                                        "update", "upgrade", "install", "migrate-installer",
                                        "--version", "-v", "--help", "-h"]
-        var ids: [String] = []
+        let projects = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
+        let dirs = (try? FileManager.default.contentsOfDirectory(at: projects, includingPropertiesForKeys: nil)) ?? []
+        // id -> its transcript (nil until resolved). Deduped by id so the same
+        // session found via a flag AND via lsof isn't counted twice.
+        var transcriptByID: [String: URL] = [:]
+        var flagIDs = Set<String>()
+        var headlessPIDs: [Int32] = []
         for raw in text.split(separator: "\n") {
-            let tokens = raw.split(separator: " ").map(String.init)
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard let sp = line.firstIndex(of: " ") else { continue }
+            let pid = Int32(line[..<sp]) ?? -1
+            let command = line[line.index(after: sp)...]
+            let tokens = command.split(separator: " ").map(String.init)
             guard let first = tokens.first,
                   (first as NSString).lastPathComponent == "claude" else { continue }
             if tokens.count > 1, nonSession.contains(tokens[1]) { continue }
-            guard let id = flagValue("--session-id", in: tokens) ?? flagValue("--resume", in: tokens) else { continue }
-            ids.append(id)
+            if let id = flagValue("--session-id", in: tokens) ?? flagValue("--resume", in: tokens) {
+                flagIDs.insert(id)
+            } else if pid > 0 {
+                headlessPIDs.append(pid)
+            }
         }
-        guard !ids.isEmpty else { return [] }
-
-        let projects = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
-        let dirs = (try? FileManager.default.contentsOfDirectory(at: projects, includingPropertiesForKeys: nil)) ?? []
-        let hex = providerHex("anthropic")
-        return ids.map { id in
-            var transcript: URL?
-            var age = Double.greatestFiniteMagnitude
+        // Flag-id sessions: locate their transcript by filename (existing behaviour).
+        for id in flagIDs {
             for dir in dirs {
                 let candidate = dir.appendingPathComponent("\(id).jsonl")
-                if let modified = (try? FileManager.default.attributesOfItem(atPath: candidate.path))?[.modificationDate] as? Date {
-                    transcript = candidate
-                    age = now.timeIntervalSince(modified)
+                if FileManager.default.fileExists(atPath: candidate.path) {
+                    transcriptByID[id] = candidate
                     break
                 }
+            }
+        }
+        // Headless sessions: the id is the transcript the process holds open.
+        for url in openClaudeTranscripts(pids: headlessPIDs) {
+            let id = url.deletingPathExtension().lastPathComponent
+            if transcriptByID[id] == nil { transcriptByID[id] = url }
+        }
+        // Include flag ids that resolved to no transcript too (a just-started session).
+        let ids = Set(transcriptByID.keys).union(flagIDs)
+        guard !ids.isEmpty else { return [] }
+
+        let hex = providerHex("anthropic")
+        return ids.map { id in
+            let transcript = transcriptByID[id]
+            var age = Double.greatestFiniteMagnitude
+            if let transcript,
+               let modified = (try? FileManager.default.attributesOfItem(atPath: transcript.path))?[.modificationDate] as? Date {
+                age = now.timeIntervalSince(modified)
             }
             // Prefer the exact turn state (no lag); fall back to freshness only if
             // the transcript tail can't be parsed.
             let busy = transcript.flatMap { claudeTurnActive($0) } ?? (age < localBusyWindow)
             return LocalSession(key: "local:claude:\(id)", hex: hex, busy: busy, order: 0)
         }
+    }
+
+    // Transcripts (~/.claude/projects/**/<id>.jsonl) currently held OPEN by the
+    // given pids — one lsof call resolves a headless `claude` session's id without
+    // a command-line flag. Empty pids → no call.
+    private static func openClaudeTranscripts(pids: [Int32]) -> [URL] {
+        guard !pids.isEmpty else { return [] }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        proc.arguments = ["-nP", "-Fn", "-p", pids.map(String.init).joined(separator: ",")]
+        let out = Pipe()
+        proc.standardOutput = out
+        proc.standardError = FileHandle.nullDevice
+        do { try proc.run() } catch { return [] }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        guard let text = String(data: data, encoding: .utf8) else { return [] }
+        var urls: [URL] = []
+        var seen = Set<String>()
+        for line in text.split(separator: "\n") where line.hasPrefix("n") {
+            let path = String(line.dropFirst())
+            guard path.contains("/.claude/projects/"), path.hasSuffix(".jsonl") else { continue }
+            if seen.insert(path).inserted { urls.append(URL(fileURLWithPath: path)) }
+        }
+        return urls
     }
 
     // Codex has no per-session process to watch, so use its rollout freshness:
@@ -3159,8 +3239,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private static func flagValue(_ flag: String, in tokens: [String]) -> String? {
-        guard let index = tokens.firstIndex(of: flag), index + 1 < tokens.count else { return nil }
-        return tokens[index + 1]
+        // "--flag value"
+        if let index = tokens.firstIndex(of: flag), index + 1 < tokens.count {
+            return tokens[index + 1]
+        }
+        // "--flag=value" — how headless launches pass the id (Hermes Desktop runs
+        // `claude … --resume=<id>` / `--session-id=<id>`), which the space form missed.
+        let prefix = flag + "="
+        if let token = tokens.first(where: { $0.hasPrefix(prefix) }) {
+            let value = String(token.dropFirst(prefix.count))
+            return value.isEmpty ? nil : value
+        }
+        return nil
     }
 
     // opencode has no long-lived per-session process to watch, so read its local

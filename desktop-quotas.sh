@@ -19,6 +19,7 @@ SUPPORT = Path.home() / "Library/Application Support/Hermes"
 # body is written to stdout.
 ENDPOINT = sys.argv[1] if len(sys.argv) > 1 else "/api/plugins/provider-quota/quotas?refresh=true"
 OUT = sys.argv[2] if len(sys.argv) > 2 else None
+ACTIVITY = ENDPOINT == "--activity"
 # Activity polls run on the menu-bar's 1s timer and only read session lists, so a
 # slow gateway call must fail FAST — a 20s hang would stall the in-flight guard
 # and make a session's dot appear (or clear) many seconds late. Quota fetches hit
@@ -27,8 +28,18 @@ TIMEOUT = 6 if ENDPOINT == "--activity" else 20
 
 
 def fail(msg):
+    # In --activity mode a broken PRIMARY connection (signed out, expired token,
+    # unreachable) must NOT kill the whole scan — the local Desktop-spawned backend
+    # is read separately and still has live sessions. Raise a catchable error there;
+    # only quota/single-endpoint mode exits hard.
+    if ACTIVITY:
+        raise _PrimaryUnavailable(msg)
     sys.stderr.write(msg.rstrip() + "\n")
     sys.exit(1)
+
+
+class _PrimaryUnavailable(Exception):
+    pass
 
 
 def emit(data):
@@ -73,103 +84,113 @@ def http_get(url, headers):
 
 
 # --- Which gateway is the Desktop bound to? Prefer the primary entry in the v2
-# connections.json, fall back to the legacy connection.json. ---
-conns = read_json("connections.json") or {}
-primary = None
-if isinstance(conns.get("connections"), list) and conns["connections"]:
-    by_id = {c.get("id"): c for c in conns["connections"]}
-    primary = by_id.get(conns.get("primary")) or conns["connections"][0]
+# connections.json, fall back to the legacy connection.json. Wrapped so that in
+# --activity mode a broken/absent primary doesn't abort — fetch stays None and the
+# scan proceeds with the local Desktop-spawned backend only. ---
+fetch = None
+EXPIRED_MSG = "Hermes gateway returned HTTP %s."
+try:
+    conns = read_json("connections.json") or {}
+    primary = None
+    if isinstance(conns.get("connections"), list) and conns["connections"]:
+        by_id = {c.get("id"): c for c in conns["connections"]}
+        primary = by_id.get(conns.get("primary")) or conns["connections"][0]
 
-if primary is not None:
-    kind = primary.get("kind")
-    url = (primary.get("url") or "").rstrip("/")
-else:
-    legacy = read_json("connection.json") or {}
-    kind = legacy.get("mode")
-    url = ""
-    if kind and kind != "local":
-        url = ((legacy.get(kind) or legacy.get("remote") or {}).get("url") or "").rstrip("/")
-
-if not kind:
-    fail("Hermes Desktop is not set up.")
-
-def _norm(value):
-    return value.strip().strip("/")
-
-
-# --- Build a `fetch(path) -> (status, body)` bound to the gateway the Desktop is
-# bound to: a loopback bind (local mode) needs no auth; a remote gateway uses the
-# Desktop's OAuth session. Resolving this once lets one process serve several
-# endpoints (see --activity) with a single Keychain read / token decrypt. ---
-if kind == "local":
-    own = read_json("backend-ownership.json") or {}
-    local_url = None
-    for backend in own.get("backends") or []:
-        candidate = (backend.get("url") or backend.get("baseUrl") or "").rstrip("/")
-        if candidate:
-            local_url = candidate
-            break
-        port = backend.get("port")
-        if port:
-            local_url = "http://127.0.0.1:%s" % port
-            break
-    if not local_url:
-        fail("Hermes Desktop is in local mode but no local gateway is running.")
-
-    def fetch(path):
-        return http_get(local_url + path, {"Accept": "*/*"})
-
-    EXPIRED_MSG = "Local Hermes gateway returned HTTP %s."
-else:
-    if not url:
-        fail("Hermes Desktop has no gateway configured.")
-    tokens = read_json("native-oauth-tokens.json")
-    if tokens is None:
-        fail("Sign in to Hermes Desktop.")
-    entry = tokens.get(url) or next((v for k, v in tokens.items() if _norm(k) == _norm(url)), None)
-    if not entry:
-        fail("Sign in to Hermes Desktop (%s)." % url)
-
-    value = entry.get("value") or ""
-    if entry.get("encoding") == "safeStorage":
-        # Electron safeStorage v10: AES-128-CBC, key = PBKDF2-HMAC-SHA1(secret,
-        # "saltysalt", 1003, 16), IV = 16 spaces. Decrypt with openssl to avoid a
-        # python crypto dependency.
-        try:
-            secret = subprocess.check_output(
-                ["security", "find-generic-password", "-s", "Hermes Safe Storage", "-w"],
-                stderr=subprocess.DEVNULL,
-            ).decode().strip()
-        except Exception as exc:
-            fail("Cannot read 'Hermes Safe Storage' Keychain key: %s" % exc)
-        key = hashlib.pbkdf2_hmac("sha1", secret.encode(), b"saltysalt", 1003, dklen=16)
-        raw = base64.b64decode(value)
-        if raw[:3] != b"v10":
-            fail("Unexpected Hermes Desktop token format.")
-        proc = subprocess.run(
-            ["openssl", "enc", "-d", "-aes-128-cbc", "-K", key.hex(),
-             "-iv", "20" * 16, "-nopad"],
-            input=raw[3:], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        )
-        plaintext = proc.stdout
-        if not plaintext:
-            fail("Cannot decrypt Hermes Desktop session token (openssl).")
-        plaintext = plaintext[: -plaintext[-1]]  # strip PKCS7 padding
-        session = json.loads(plaintext.decode())
+    if primary is not None:
+        kind = primary.get("kind")
+        url = (primary.get("url") or "").rstrip("/")
     else:
-        session = json.loads(value)
+        legacy = read_json("connection.json") or {}
+        kind = legacy.get("mode")
+        url = ""
+        if kind and kind != "local":
+            url = ((legacy.get(kind) or legacy.get("remote") or {}).get("url") or "").rstrip("/")
 
-    access_token = session.get("accessToken") or ""
-    if not access_token:
-        fail("Sign in to Hermes Desktop.")
+    if not kind:
+        fail("Hermes Desktop is not set up.")
 
-    def fetch(path):
-        return http_get(url + path, {"Authorization": "Bearer " + access_token, "Accept": "*/*"})
+    def _norm(value):
+        return value.strip().strip("/")
 
-    EXPIRED_MSG = "Hermes gateway returned HTTP %s."
+    # --- Build a `fetch(path) -> (status, body)` bound to the gateway the Desktop is
+    # bound to: a loopback bind (local mode) needs no auth; a remote gateway uses the
+    # Desktop's OAuth session. Resolving this once lets one process serve several
+    # endpoints (see --activity) with a single Keychain read / token decrypt. ---
+    if kind == "local":
+        own = read_json("backend-ownership.json") or {}
+        local_url = None
+        for backend in own.get("backends") or []:
+            candidate = (backend.get("url") or backend.get("baseUrl") or "").rstrip("/")
+            if candidate:
+                local_url = candidate
+                break
+            port = backend.get("port")
+            if port:
+                local_url = "http://127.0.0.1:%s" % port
+                break
+        if not local_url:
+            fail("Hermes Desktop is in local mode but no local gateway is running.")
+
+        def fetch(path):
+            return http_get(local_url + path, {"Accept": "*/*"})
+
+        EXPIRED_MSG = "Local Hermes gateway returned HTTP %s."
+    else:
+        if not url:
+            fail("Hermes Desktop has no gateway configured.")
+        tokens = read_json("native-oauth-tokens.json")
+        if tokens is None:
+            fail("Sign in to Hermes Desktop.")
+        entry = tokens.get(url) or next((v for k, v in tokens.items() if _norm(k) == _norm(url)), None)
+        if not entry:
+            fail("Sign in to Hermes Desktop (%s)." % url)
+
+        value = entry.get("value") or ""
+        if entry.get("encoding") == "safeStorage":
+            # Electron safeStorage v10: AES-128-CBC, key = PBKDF2-HMAC-SHA1(secret,
+            # "saltysalt", 1003, 16), IV = 16 spaces. Decrypt with openssl to avoid a
+            # python crypto dependency.
+            try:
+                secret = subprocess.check_output(
+                    ["security", "find-generic-password", "-s", "Hermes Safe Storage", "-w"],
+                    stderr=subprocess.DEVNULL,
+                ).decode().strip()
+            except Exception as exc:
+                fail("Cannot read 'Hermes Safe Storage' Keychain key: %s" % exc)
+            key = hashlib.pbkdf2_hmac("sha1", secret.encode(), b"saltysalt", 1003, dklen=16)
+            raw = base64.b64decode(value)
+            if raw[:3] != b"v10":
+                fail("Unexpected Hermes Desktop token format.")
+            proc = subprocess.run(
+                ["openssl", "enc", "-d", "-aes-128-cbc", "-K", key.hex(),
+                 "-iv", "20" * 16, "-nopad"],
+                input=raw[3:], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+            plaintext = proc.stdout
+            if not plaintext:
+                fail("Cannot decrypt Hermes Desktop session token (openssl).")
+            plaintext = plaintext[: -plaintext[-1]]  # strip PKCS7 padding
+            session = json.loads(plaintext.decode())
+        else:
+            session = json.loads(value)
+
+        access_token = session.get("accessToken") or ""
+        if not access_token:
+            fail("Sign in to Hermes Desktop.")
+
+        def fetch(path, _url=url, _tok=access_token):
+            return http_get(_url + path, {"Authorization": "Bearer " + _tok, "Accept": "*/*"})
+
+        EXPIRED_MSG = "Hermes gateway returned HTTP %s."
+except _PrimaryUnavailable:
+    # --activity only: primary is signed out / unreachable. Leave fetch=None; the
+    # local-backend read below still lights the pet for local Desktop sessions.
+    fetch = None
 
 
 def get_json(path):
+    if fetch is None:
+        return None
     status, body = fetch(path)
     if status != 200:
         return None
@@ -177,6 +198,66 @@ def get_json(path):
         return json.loads(body)
     except Exception:
         return None
+
+
+def _spawned_local_backend_get_json():
+    """A get_json bound to the LOCAL `hermes serve` backend the Desktop spawned, if
+    one is running — INDEPENDENT of which connection is the Desktop's PRIMARY. A
+    Desktop chat runs on that local backend (source: desktop), so the Hermes pet has
+    to read it even when the primary connection is a REMOTE gateway whose
+    /api/sessions never lists this machine's desktop sessions. The backend's REST
+    token is not on disk — Electron mints it in memory and hands it to `serve` as
+    HERMES_DASHBOARD_SESSION_TOKEN — so resolve everything live: backend pid (from
+    backend-ownership.json) -> its listening loopback port (lsof; serve runs with
+    --port 0) -> the token from that process's OWN environment. Returns None when no
+    local backend is running or its port/token can't be resolved. This is the macOS
+    path (ps eww / lsof over our own uid); a client with only a remote gateway and no
+    local spawn simply gets None and nothing changes."""
+    import re
+    own = read_json("backend-ownership.json") or {}
+    for backend in own.get("backends") or []:
+        pid = backend.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            continue
+        base = (backend.get("url") or backend.get("baseUrl") or "").rstrip("/")
+        if not base:
+            port = backend.get("port")
+            if not port:
+                try:
+                    listing = subprocess.run(
+                        ["/usr/sbin/lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", str(pid)],
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3,
+                    ).stdout.decode("utf-8", "replace")
+                    m = re.search(r"127\.0\.0\.1:(\d+)", listing)
+                    port = m.group(1) if m else None
+                except Exception:
+                    port = None
+            if not port:
+                continue
+            base = "http://127.0.0.1:%s" % port
+        token = None
+        try:
+            env = subprocess.run(
+                ["ps", "eww", "-p", str(pid)],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3,
+            ).stdout.decode("utf-8", "replace")
+            m = re.search(r"HERMES_DASHBOARD_SESSION_TOKEN=(\S+)", env)
+            token = m.group(1) if m else None
+        except Exception:
+            token = None
+        headers = {"Accept": "*/*"}
+        if token:
+            headers["X-Hermes-Session-Token"] = token
+        def _get(path, _base=base, _headers=headers):
+            status, body = http_get(_base + path, _headers)
+            if status != 200:
+                return None
+            try:
+                return json.loads(body)
+            except Exception:
+                return None
+        return _get
+    return None
 
 
 # --- Activity mode: resolve the gateway ONCE, then fetch /api/status plus each
@@ -187,8 +268,7 @@ def get_json(path):
 # app decide what's "running". Never fails: a signed-out gateway just yields an
 # empty summary so the pet quietly stays idle. ---
 if ENDPOINT == "--activity":
-    import re, time
-    from concurrent.futures import ThreadPoolExecutor
+    import time
 
     def _dot_provider(s):
         # Colour the pet's dot by the MODEL FAMILY the user reasons about — Claude
@@ -234,15 +314,73 @@ if ENDPOINT == "--activity":
     # store (/api/sessions) carries a human-readable `last_activity_description` per
     # session — e.g. "tool running: clarify" while an agent is asking YOU to clarify.
     # Join by session_id to detect the WAITING-FOR-YOU states without a gateway change.
-    store_by_id = {}
-    try:
-        _sess = _soft(get_json)("/api/sessions") or {}
-        for _s in (_sess.get("sessions") or []):
+    # Collect sessions from the PRIMARY connection AND — always — the local
+    # `hermes serve` backend the Desktop spawned, if any. Desktop chats run on that
+    # local backend (source: desktop); when the primary connection is a REMOTE
+    # gateway its /api/sessions never lists them, so without this merge the Hermes
+    # pet is blind to the very sessions you start from the app.
+    #
+    # A session id can appear in BOTH stores — e.g. a claude-code/imported session
+    # that is LIVE on the local backend but lingers as an ENDED, model-less row on
+    # the remote primary. Dedup must therefore keep the MOST-ALIVE copy per id (open
+    # beats ended; among open, is_active beats idle; then newer last_active wins),
+    # never merely the first one seen — otherwise the primary's dead copy shadows the
+    # local live one and that session (often the Codex/GPT turn) shows no pet point.
+    def _last_active_of(sess):
+        for k in ("last_active", "last_activity_at", "started_at"):
+            v = sess.get(k)
+            if isinstance(v, (int, float)) and v > 0:
+                return float(v)
+        return 0.0
+
+    def _more_alive(new, old):
+        # True when `new` is a livelier representation of the same session than `old`.
+        new_open = new.get("ended_at") is None
+        old_open = old.get("ended_at") is None
+        if new_open != old_open:
+            return new_open
+        if bool(new.get("is_active")) != bool(old.get("is_active")):
+            return bool(new.get("is_active"))
+        return _last_active_of(new) > _last_active_of(old)
+
+    best_by_id = {}
+    order = []          # session ids in first-seen order (stable output)
+    anon = []           # sessions with no id — can't dedup, keep as-is
+
+    def _ingest(container):
+        if not isinstance(container, dict):
+            return
+        for _s in (container.get("sessions") or []):
             _sid = _s.get("session_id") or _s.get("id")
-            if _sid:
-                store_by_id[str(_sid)] = _s
+            if not _sid:
+                anon.append(_s)
+                continue
+            _sid = str(_sid)
+            cur = best_by_id.get(_sid)
+            if cur is None:
+                best_by_id[_sid] = _s
+                order.append(_sid)
+            elif _more_alive(_s, cur):
+                best_by_id[_sid] = _s
+
+    try:
+        _ingest(_soft(get_json)("/api/sessions"))
+        _local_get = _spawned_local_backend_get_json()
+        if _local_get is not None:
+            _ingest(_soft(_local_get)("/api/sessions"))
+            # If the primary's plugin /activity came back empty (typical when the
+            # primary is a remote gateway but the live sessions are local), let the
+            # local backend's /activity be the fallback list too.
+            if not (act.get("sessions") if isinstance(act, dict) else None):
+                _local_act = _soft(_local_get)("/api/plugins/provider-quota/activity")
+                if isinstance(_local_act, dict) and _local_act.get("sessions"):
+                    act = _local_act
     except Exception:
         pass
+
+    merged_sessions = [best_by_id[i] for i in order] + anon
+    store_by_id = {i: best_by_id[i] for i in order}
+    _sess = {"sessions": merged_sessions}
 
     def _store(sess):
         return store_by_id.get(str(sess.get("session_id") or ""), {})
@@ -277,8 +415,8 @@ if ENDPOINT == "--activity":
             return "permission"
         if st in ("waiting", "awaiting_input", "needs_input", "input_required"):
             return "input"
-        # Else derive from the session store's activity description.
-        d = str(_store(sess).get("last_activity_description") or "").lower()
+        # Else derive from the activity description (the session's own, else the store's).
+        d = str(sess.get("last_activity_description") or _store(sess).get("last_activity_description") or "").lower()
         if any(p in d for p in _PERM_PHRASES):
             return "permission"
         if any(p in d for p in _INPUT_PHRASES):
@@ -293,37 +431,71 @@ if ENDPOINT == "--activity":
                 return "permission"
         return ""
 
-    for s in act.get("sessions") or []:
-        active = bool(s.get("is_active"))
+    # A session is LIVE when it's still OPEN (ended_at is None) AND the gateway's
+    # is_active flag says a turn is running. is_active is AUTHORITATIVE: the gateway
+    # keeps it True for the whole turn (even a long Desktop generation that doesn't
+    # bump last_active) and flips it False the INSTANT the turn completes or is
+    # stopped. So we must NOT resurrect a finished-but-open session from a stale
+    # "receiving stream response" description — that's the "pet stayed active after
+    # the turn finished" bug. Ended sessions never dot (honours "only active").
+    #
+    # Only when the gateway OMITS is_active entirely (older/partial store rows) do we
+    # fall back to a freshness gate: recent activity within _FRESH, which also
+    # rejects LEAKED sessions left open for days frozen at "starting API call #1".
+    _FRESH = 120.0
+    now = time.time()
+
+    def _last_activity(sess):
+        for k in ("last_active", "last_activity_at", "started_at"):
+            v = sess.get(k)
+            if isinstance(v, (int, float)) and v > 0:
+                return float(v)
+        return 0.0
+
+    def _live(sess):
+        ia = sess.get("is_active")
+        if isinstance(ia, bool):
+            return ia                       # authoritative — trust it, True or False
+        # is_active absent: fall back to plain recency (and never resurrect a leaked
+        # days-old session).
+        la = _last_activity(sess)
+        return bool(la) and (now - la) <= _FRESH
+
+    store_list = _sess.get("sessions") if isinstance(_sess, dict) else None
+    if store_list:
+        candidates = [s for s in store_list if s.get("ended_at") is None and _live(s)]
+    else:
+        candidates = [s for s in (act.get("sessions") or []) if s.get("is_active")]
+
+    for s in candidates:
         att = _attention(s)
-        # A session waiting for you counts as ATTENTION, not "busy" — don't let it set
+        # A session waiting for YOU counts as ATTENTION, not "busy" — don't let it set
         # the aggregate busy flag (the pet should wave, not read as working).
-        if active and att == "":
+        if att == "":
             status_busy = True
-        # Colour by the LIVE model. Prefer the AUTHORITATIVE session store's current
-        # `model` (the /activity plugin's model resolution can lag — it reported
-        # anthropic while the live model was codex). Then the plugin's models list,
-        # then billing/provider. A multi-model session still splits into a wedge per
-        # distinct family.
+        # Colour by the LIVE model from the store session (falling back to the joined
+        # store entry, then billing/provider). Multi-model → one wedge per family.
         st = _store(s)
-        if st.get("model") or st.get("models"):
-            model_list = ([st["model"]] if st.get("model") else []) + (st.get("models") or [])
-        else:
-            model_list = s.get("models") or []
+        src = st if (st.get("model") or st.get("models")) else s
+        model_list = ([src["model"]] if src.get("model") else []) + (src.get("models") or [])
         families = []
         for m in model_list:
             fam = _dot_provider({"model": m})
             if fam and fam not in families:
                 families.append(fam)
         if not families:
-            fam = _dot_provider({"model": st.get("model"), "billing_provider": st.get("billing_provider")}) or _dot_provider(s)
+            fam = _dot_provider({"model": src.get("model"), "billing_provider": src.get("billing_provider")}) or _dot_provider(s)
             families = [fam] if fam else []
         out.append({
-            "is_active": active,
+            # Pass through the gateway's REAL is_active (default True only when the
+            # store omits it — those rows were admitted via the freshness fallback),
+            # so the app keeps is_active as its authoritative liveness signal and its
+            # own zombie/ended-grace backstops still apply.
+            "is_active": s.get("is_active") if isinstance(s.get("is_active"), bool) else True,
             "ended_at": s.get("ended_at"),
-            "last_active": time.time() if active else s.get("last_active"),
-            "billing_provider": _dot_provider({"model": st.get("model"), "billing_provider": st.get("billing_provider")}) or _dot_provider(s),
-            "provider": st.get("provider") or s.get("provider"),
+            "last_active": _last_activity(s) or now,
+            "billing_provider": _dot_provider({"model": src.get("model"), "billing_provider": src.get("billing_provider")}) or _dot_provider(s),
+            "provider": src.get("provider") or s.get("provider"),
             "providers": families,
             "needs_input": att == "input",
             "needs_permission": att == "permission",
