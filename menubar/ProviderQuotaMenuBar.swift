@@ -1506,17 +1506,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // just recolours to the provider's colour on hover (and stays coloured while
         // expanded). The expanded state's vertical accent line is drawn by the
         // section container, not here.
-        let view = hoverRow(NSRect(x: 0, y: 0, width: 360, height: 36), tint: providerBrandColor(provider), persistent: false)
+        // When EXPANDED the header drops its second (summary) line — that info now
+        // lives in the window rows below — so the header shrinks to a single centred
+        // line (26px vs 36px).
+        let rowH: CGFloat = expanded ? 26 : 36
+        let view = hoverRow(NSRect(x: 0, y: 0, width: 360, height: rowH), tint: providerBrandColor(provider), persistent: false)
         view.drawsBorder = false
         // One chevron that ROTATES between collapsed (▶) and expanded (▼) so the
         // icon change is a smooth spin, not a symbol swap. Layer-anchored at its
         // centre for the rotation.
-        let chevron = NSImageView(frame: NSRect(x: 13, y: 12, width: 12, height: 12))
+        let chevronY: CGFloat = expanded ? 7 : 12
+        let chevron = NSImageView(frame: NSRect(x: 13, y: chevronY, width: 12, height: 12))
         chevron.image = NSImage(systemSymbolName: "chevron.right", accessibilityDescription: expanded ? "Collapse" : "Expand")
         chevron.contentTintColor = expanded ? providerBrandColor(provider) : menuTertiaryColor()
         chevron.wantsLayer = true
         chevron.layer?.anchorPoint = CGPoint(x: 0.5, y: 0.5)
-        chevron.frame = NSRect(x: 13, y: 12, width: 12, height: 12)   // re-apply after anchorPoint
+        chevron.frame = NSRect(x: 13, y: chevronY, width: 12, height: 12)   // re-apply after anchorPoint
         let targetAngle: CGFloat = expanded ? -.pi / 2 : 0            // ▶ → ▼
         chevron.layer?.setValue(targetAngle, forKeyPath: "transform.rotation.z")
         view.addSubview(chevron)
@@ -1535,21 +1540,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         view.hoverHandler = { [weak chevron] hovering in
             chevron?.contentTintColor = (hovering || expanded) ? brand : idle
         }
-        let symbol = providerSymbolName(provider.provider)
-        let image = NSImageView(frame: NSRect(x: 50, y: 17, width: 14, height: 14))
-        image.image = NSImage(systemSymbolName: symbol, accessibilityDescription: provider.label)
-        // Always the provider's own colour — even out of quota or offline — so the
-        // row reads consistently; the status dot (red ring) flags any problem.
-        image.contentTintColor = providerBrandColor(provider)
-        view.addSubview(image)
-        view.addSubview(label(provider.label, frame: NSRect(x: 70, y: 17, width: 130, height: 16), font: .systemFont(ofSize: 12, weight: .semibold), color: providerBrandColor(provider)))
-        if let plan = provider.plan {
-            view.addSubview(label(plan.uppercased(), frame: NSRect(x: 196, y: 18, width: 94, height: 14), font: .systemFont(ofSize: 8.5, weight: .medium), color: menuTertiaryColor(), alignment: .right))
+        view.addSubview(label(provider.label, frame: NSRect(x: 70, y: expanded ? 5 : 17, width: 130, height: 16), font: .systemFont(ofSize: 12, weight: .semibold), color: providerBrandColor(provider)))
+        if let plan = displayPlan(provider) {
+            view.addSubview(label(plan.uppercased(), frame: NSRect(x: 196, y: expanded ? 6 : 18, width: 94, height: 14), font: .systemFont(ofSize: 8.5, weight: .medium), color: menuTertiaryColor(), alignment: .right))
         }
         // A provider that just RESET swaps its status dot for a green reset icon and
         // leads its summary with "Quota back" for a few seconds (the pet waves too).
         let recovered = providerRecentlyRecovered(key)
-        let statusImage = NSImageView(frame: NSRect(x: recovered ? 322 : 323, y: recovered ? 17 : 18, width: recovered ? 15 : 12, height: recovered ? 15 : 12))
+        let statusImage = NSImageView(frame: NSRect(x: recovered ? 322 : 323, y: expanded ? 7 : (recovered ? 17 : 18), width: recovered ? 15 : 12, height: recovered ? 15 : 12))
         if recovered {
             statusImage.image = NSImage(systemSymbolName: "arrow.clockwise.circle.fill", accessibilityDescription: "Quota reset — available again")
             statusImage.contentTintColor = .hermesGreen
@@ -1570,12 +1568,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // out-of-quota row draws NO bar (a 0%-full bar is just noise) and gives the
         // summary the full width for its longer "Resets … · over limit" text. When
         // EXPANDED, the per-window rows below already show the bar + numbers, so the
-        // header drops its own summary bar to avoid a doubled usage graph — it keeps
-        // only the brief text line.
+        // header drops its own summary line AND bar to avoid a doubled usage graph —
+        // it keeps only the single name line.
         let barWillShow = !expanded && connected && provider.status == "ok" && !providerIsExhausted(provider)
             && collapsedRemainingPercent(provider) != nil
         let summaryWidth: CGFloat = barWillShow ? 156 : 250
-        view.addSubview(label(summaryText, frame: NSRect(x: 70, y: 2, width: summaryWidth, height: 14), font: .systemFont(ofSize: 9.5), color: recovered ? .hermesGreen : menuSecondaryColor()))
+        if !expanded {
+            view.addSubview(label(summaryText, frame: NSRect(x: 70, y: 2, width: summaryWidth, height: 14), font: .systemFont(ofSize: 9.5), color: recovered ? .hermesGreen : menuSecondaryColor()))
+        }
         // Bar tracks the collapsed %: the current-session window for %-based
         // providers (Codex/Claude); amount-only providers (OpenRouter) keep their
         // existing bar via the min fallback.
@@ -1601,11 +1601,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.setAccessibilityLabel(expanded ? "Collapse \(provider.label)" : "Expand \(provider.label)")
         view.addSubview(button)
         // Eye toggle: whether this provider's dot shows in the closed menu bar.
-        // Placed on the LEFT, right after the collapse chevron, so the row's
-        // controls (chevron + eye) sit together. Added AFTER the full-row expand
-        // button so it stays independently clickable on top of it.
+        // Sits in the slot the provider icon used to occupy, vertically centred
+        // against the title + subtitle block. Added AFTER the full-row expand button
+        // so it stays independently clickable on top of it.
         let shown = providerShownInMenuBar(kind, provider.provider)
-        let eye = NSButton(frame: NSRect(x: 28, y: 10, width: 18, height: 18))
+        let eye = NSButton(frame: NSRect(x: 46, y: expanded ? 4 : 9, width: 18, height: 18))
         eye.isBordered = false
         eye.title = ""
         eye.image = NSImage(systemSymbolName: shown ? "eye" : "eye.slash",
@@ -1844,6 +1844,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         provider.status == "ok" && provider.windows.contains(where: \.limitReached)
     }
 
+    // The "Extra usage: 242.00 / 200.00 USD" overflow-spend line. It's noisy and
+    // easy to misread as a hard cap, so it's hidden from the expanded detail rows.
+    private func isExtraUsageDetail(_ detail: String) -> Bool {
+        detail.lowercased().hasPrefix("extra usage")
+    }
+
+    // The plan/tier badge shown at the right of a provider row. Prefer whatever the
+    // reader supplied; for Claude, fall back to the local Claude subscription
+    // (organizationType / rate-limit tier from ~/.claude.json) so a Team/Max/Pro
+    // subscription shows even when the gateway payload carries no plan.
+    private func displayPlan(_ provider: QuotaProvider) -> String? {
+        if let plan = provider.plan, !plan.isEmpty { return plan }
+        if Self.normalizedProvider(provider.provider) == "anthropic" {
+            return Self.claudeSubscriptionLabel
+        }
+        return nil
+    }
+
+    // Read once: Claude's subscription from ~/.claude.json's oauthAccount. Maps the
+    // organizationType / seatTier / rate-limit tier to a short badge (Team, Max, Pro).
+    static let claudeSubscriptionLabel: String? = {
+        let path = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude.json")
+        guard let data = try? Data(contentsOf: path),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let account = root["oauthAccount"] as? [String: Any] else { return nil }
+        let orgType = (account["organizationType"] as? String ?? "").lowercased()
+        let seat = (account["seatTier"] as? String ?? "").lowercased()
+        let tier = (account["userRateLimitTier"] as? String ?? "").lowercased()
+        if orgType.contains("team") || seat.contains("team") { return "Team" }
+        if orgType.contains("enterprise") { return "Enterprise" }
+        if tier.contains("max") { return "Max" }
+        if tier.contains("pro") { return "Pro" }
+        return nil
+    }()
+
     // After each fetch, diff every connected+ok provider's exhaustion against the
     // last reading. A provider that WAS out of quota and now has some again just
     // reset — stamp it so its row and pet briefly celebrate. Disconnected / non-ok
@@ -1920,16 +1955,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case "openai-codex": return "Codex"
         case "antigravity":  return "Antigravity"
         default:             return slug.replacingOccurrences(of: "-", with: " ").replacingOccurrences(of: "_", with: " ").capitalized
-        }
-    }
-
-    private func providerSymbolName(_ provider: String) -> String {
-        switch Self.normalizedProvider(provider) {
-        case "openrouter": return "arrow.triangle.branch"
-        case "opencode":   return "terminal"
-        case "anthropic":  return "sparkles"
-        case "antigravity": return "atom"
-        default:           return "chevron.left.forwardslash.chevron.right"   // Codex / other
         }
     }
 
@@ -2755,7 +2780,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         for window in displayWindows(provider) {
                             rows.append(windowView(window, provider: provider))
                         }
-                        for detail in provider.details {
+                        for detail in provider.details where !isExtraUsageDetail(detail) {
                             rows.append(detailView(detail))
                         }
                         let rowsH = rows.reduce(CGFloat(0)) { $0 + $1.frame.height }
