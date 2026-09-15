@@ -179,24 +179,55 @@ final class HoverGlowButton: NSButton {
 
     override func mouseEntered(with event: NSEvent) {
         hovering = true
-        updateGlow()
+        updateGlow(animated: true)
     }
 
     override func mouseExited(with event: NSEvent) {
         hovering = false
-        updateGlow()
+        updateGlow(animated: true)
     }
 
-    private func updateGlow() {
+    private func updateGlow(animated: Bool = false) {
+        guard let layer else { return }
         // Always-on glow (colored fill + border + soft shadow) that intensifies
-        // on hover, so the buttons read as glowing Hermes chips at rest.
-        layer?.backgroundColor = glowColor.withAlphaComponent(hovering ? 0.30 : 0.16).cgColor
-        layer?.borderColor = glowColor.withAlphaComponent(hovering ? 1.0 : 0.6).cgColor
-        layer?.borderWidth = 1
-        layer?.shadowColor = glowColor.cgColor
-        layer?.shadowOpacity = hovering ? 0.95 : 0.55
-        layer?.shadowRadius = hovering ? 10 : 6
-        layer?.shadowOffset = .zero
+        // on hover, so the buttons read as glowing Hermes chips at rest. On hover
+        // the change is ANIMATED — the fill/border/shadow ramp up together and the
+        // chip gives a small lift — so the glow blooms in rather than snapping.
+        let bg = glowColor.withAlphaComponent(hovering ? 0.34 : 0.16).cgColor
+        let border = glowColor.withAlphaComponent(hovering ? 1.0 : 0.6).cgColor
+        let shadowOpacity: Float = hovering ? 1.0 : 0.55
+        let shadowRadius: CGFloat = hovering ? 13 : 6
+        let scale: CGFloat = hovering ? 1.05 : 1.0
+
+        layer.shadowColor = glowColor.cgColor
+        layer.borderWidth = 1
+        layer.shadowOffset = .zero
+
+        if animated {
+            let duration = hovering ? 0.22 : 0.3
+            let timing = CAMediaTimingFunction(name: hovering ? .easeOut : .easeInEaseOut)
+            func ramp(_ keyPath: String, to value: Any?, from: Any?) {
+                let anim = CABasicAnimation(keyPath: keyPath)
+                anim.fromValue = from
+                anim.toValue = value
+                anim.duration = duration
+                anim.timingFunction = timing
+                layer.add(anim, forKey: keyPath)
+            }
+            ramp("backgroundColor", to: bg, from: layer.backgroundColor)
+            ramp("borderColor", to: border, from: layer.borderColor)
+            ramp("shadowOpacity", to: shadowOpacity, from: layer.shadowOpacity)
+            ramp("shadowRadius", to: shadowRadius, from: layer.shadowRadius)
+            ramp("transform.scale", to: scale, from: layer.value(forKeyPath: "transform.scale"))
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.backgroundColor = bg
+        layer.borderColor = border
+        layer.shadowOpacity = shadowOpacity
+        layer.shadowRadius = shadowRadius
+        layer.setValue(scale, forKeyPath: "transform.scale")
+        CATransaction.commit()
     }
 }
 
@@ -211,6 +242,114 @@ final class ThemedMenuContainer: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         window?.appearance = forcedAppearance
+    }
+}
+
+// A themed menu row with a rounded brand-colour border on hover (optionally a
+// steady border when `persistent`, and a soft outer glow when `hoverGlow`). Set
+// `drawsBorder = false` where the hover cue is carried elsewhere (e.g. a provider
+// row recolours its expand chevron), and `hoverHandler` to react to hover.
+final class HoverRowView: NSView {
+    var forcedAppearance: NSAppearance?
+    var tint: NSColor = .controlAccentColor
+    // A row that shouldn't react to its own hover (e.g. an expanded-section container).
+    var respondsToHover = true
+    // Whether hover adds a soft outer glow (source chips) vs a plain border.
+    var hoverGlow = false
+    // When false, the row draws no border/glow at all.
+    var drawsBorder = true
+    // Called on hover enter/exit so the owner can react (e.g. tint the chevron).
+    var hoverHandler: ((Bool) -> Void)?
+    var persistent = false {
+        didSet { if persistent != oldValue { refresh(animated: true) } }
+    }
+    private let strokeLayer = CAShapeLayer()
+    private var hoverArea: NSTrackingArea?
+    private var hovering = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        commonInit()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        commonInit()
+    }
+
+    private func commonInit() {
+        wantsLayer = true
+        layer?.masksToBounds = false
+        strokeLayer.fillColor = NSColor.clear.cgColor
+        strokeLayer.lineWidth = 1
+        strokeLayer.masksToBounds = false
+        strokeLayer.shadowOffset = .zero
+        strokeLayer.shadowOpacity = 0
+        layer?.addSublayer(strokeLayer)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        window?.appearance = forcedAppearance
+    }
+
+    override func layout() {
+        super.layout()
+        let path = CGPath(roundedRect: bounds.insetBy(dx: 6, dy: 2), cornerWidth: 8, cornerHeight: 8, transform: nil)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        strokeLayer.path = path
+        strokeLayer.shadowPath = path
+        CATransaction.commit()
+        refresh()
+    }
+
+    override func updateTrackingAreas() {
+        if let hoverArea { removeTrackingArea(hoverArea) }
+        let area = NSTrackingArea(rect: bounds, options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited], owner: self)
+        addTrackingArea(area)
+        hoverArea = area
+        super.updateTrackingAreas()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        guard respondsToHover else { return }
+        hovering = true
+        hoverHandler?(true)
+        refresh(animated: true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        guard respondsToHover else { return }
+        hovering = false
+        hoverHandler?(false)
+        refresh(animated: true)
+    }
+
+    func refresh(animated: Bool = false) {
+        // A crisp brand-colour border (no fill — a fill washed out the row text).
+        // The soft outer glow appears only on hover when `hoverGlow` is set.
+        let border: CGColor
+        let width: CGFloat
+        if drawsBorder && hovering {
+            border = tint.withAlphaComponent(1.0).cgColor
+            width = 1.5
+        } else if drawsBorder && persistent {
+            border = tint.withAlphaComponent(0.7).cgColor
+            width = 1.5
+        } else {
+            border = NSColor.clear.cgColor
+            width = 1
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(!animated)
+        if animated { CATransaction.setAnimationDuration(0.16) }
+        strokeLayer.strokeColor = border
+        strokeLayer.lineWidth = width
+        strokeLayer.shadowColor = tint.cgColor
+        strokeLayer.shadowOpacity = (drawsBorder && hovering && hoverGlow) ? 0.8 : 0
+        strokeLayer.shadowRadius = 4
+        CATransaction.commit()
     }
 }
 
@@ -656,11 +795,11 @@ final class ActivityPetsView: NSView {
     }
 
     private func rebuildToolTips() {
+        // No hover tooltips on the closed-menu pet points — the points speak for
+        // themselves; a tooltip popping up on hover while the menu is closed was
+        // noise. Clear any previously-installed tags.
         toolTipTags.forEach(removeToolTip)
-        toolTipTags = tiles.indices.map { index in
-            let x = CGFloat(index) * (Self.tileWidth + Self.tileGap) * scale
-            return addToolTip(NSRect(x: x, y: 0, width: Self.tileWidth * scale, height: Self.tileHeight * scale), owner: self, userData: nil)
-        }
+        toolTipTags = []
     }
 
     func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint, userData data: UnsafeMutableRawPointer?) -> String {
@@ -1086,6 +1225,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Providers whose detail is expanded (collapsed by default → brief row with a
     // bar; click to expand for per-window info). Session-scoped.
     private var expandedProviders = Set<String>()
+    // The provider key just toggled OPEN (via a click), so only IT animates its
+    // expand — a menu rebuild/reopen shouldn't re-animate already-open sections.
+    private var justExpandedProvider: String?
     // Provider keys observed OUT OF QUOTA on the latest connected reading — so a
     // later reading that has quota again is recognised as a RESET (its window
     // rolled over), not a first sighting. Only connected+ok readings mutate this.
@@ -1206,12 +1348,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         syncPetsFromGateway()  // reflect a pet installed since the last open
     }
 
+    func menuDidClose(_ menu: NSMenu) {
+        // Reset the menu's disclosure state so it reopens in its default, collapsed
+        // shape: no provider expanded, and the "Sources" settings section closed.
+        expandedProviders.removeAll()
+        sourcesExpanded = false
+        justExpandedProvider = nil
+    }
+
     private func updateStatusItem() {
         guard let button = statusItem.button else { return }
         button.image = statusDotsImage()
         button.imagePosition = .imageOnly
         button.title = ""
-        button.toolTip = statusTooltip()
+        // No hover tooltip on the menu-bar icon — clicking opens the menu, which
+        // carries the detail; the closed-state hover popup was noise.
+        button.toolTip = nil
         button.setAccessibilityLabel("Provider quota status")
     }
 
@@ -1247,6 +1399,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let item = NSMenuItem()
         item.view = view
         menu.addItem(item)
+    }
+
+    // A menu row that highlights on hover (and stays lit while `persistent`),
+    // themed like menuMaterialView. Used for the clickable/expandable rows so the
+    // hover cue lives on the row itself.
+    private func hoverRow(_ frame: NSRect, tint: NSColor, persistent: Bool = false) -> HoverRowView {
+        let view = HoverRowView(frame: frame)
+        view.forcedAppearance = themedAppearance()
+        view.appearance = themedAppearance()
+        view.tint = tint
+        view.persistent = persistent
+        view.refresh()
+        return view
     }
 
     private func titleView() -> NSView {
@@ -1310,19 +1475,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // row is clickable to reveal the provider again (not only the eye). Kept
         // short so a stack of hidden providers takes little room.
         if !providerShownInMenuBar(kind, provider.provider) {
-            let row = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 22))
-            let dot = NSImageView(frame: NSRect(x: 18, y: 7, width: 8, height: 8))
-            dot.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: nil)
-            dot.imageScaling = .scaleProportionallyDown
-            dot.contentTintColor = providerBrandColor(provider)
-            row.addSubview(dot)
-            row.addSubview(label(provider.label, frame: NSRect(x: 32, y: 4, width: 250, height: 14),
-                                 font: .systemFont(ofSize: 11, weight: .medium), color: menuTertiaryColor()))
-            let eyeIcon = NSImageView(frame: NSRect(x: 300, y: 3, width: 16, height: 16))
+            let row = hoverRow(NSRect(x: 0, y: 0, width: 360, height: 22), tint: providerBrandColor(provider))
+            // Eye on the LEFT (matching the shown rows), then the colour dot + name.
+            let eyeIcon = NSImageView(frame: NSRect(x: 27, y: 3, width: 16, height: 16))
             eyeIcon.image = NSImage(systemSymbolName: "eye.slash", accessibilityDescription: "Hidden — click the row to show")
             eyeIcon.imageScaling = .scaleProportionallyDown
             eyeIcon.contentTintColor = menuTertiaryColor()
             row.addSubview(eyeIcon)
+            let dot = NSImageView(frame: NSRect(x: 52, y: 7, width: 8, height: 8))
+            dot.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: nil)
+            dot.imageScaling = .scaleProportionallyDown
+            dot.contentTintColor = providerBrandColor(provider)
+            row.addSubview(dot)
+            row.addSubview(label(provider.label, frame: NSRect(x: 66, y: 4, width: 230, height: 14),
+                                 font: .systemFont(ofSize: 11, weight: .medium), color: menuTertiaryColor()))
             // Whole-row reveal button on top: click anywhere to show the provider.
             let reveal = NSButton(frame: row.bounds)
             reveal.isBordered = false
@@ -1330,32 +1496,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             reveal.identifier = NSUserInterfaceItemIdentifier(key)
             reveal.target = self
             reveal.action = #selector(toggleProviderMenuBar(_:))
-            reveal.toolTip = "Show \(provider.label) again"
+            reveal.setAccessibilityLabel("Show \(provider.label) again")
             row.addSubview(reveal)
             return row
         }
 
-        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 48))
         let expanded = expandedProviders.contains(key)
-        let chevron = NSImageView(frame: NSRect(x: 13, y: 18, width: 12, height: 12))
-        chevron.image = NSImage(systemSymbolName: expanded ? "chevron.down" : "chevron.right", accessibilityDescription: expanded ? "Collapse" : "Expand")
-        chevron.contentTintColor = menuTertiaryColor()
+        // No row border and no underline on the collapsed row — the expand CHEVRON
+        // just recolours to the provider's colour on hover (and stays coloured while
+        // expanded). The expanded state's vertical accent line is drawn by the
+        // section container, not here.
+        let view = hoverRow(NSRect(x: 0, y: 0, width: 360, height: 36), tint: providerBrandColor(provider), persistent: false)
+        view.drawsBorder = false
+        // One chevron that ROTATES between collapsed (▶) and expanded (▼) so the
+        // icon change is a smooth spin, not a symbol swap. Layer-anchored at its
+        // centre for the rotation.
+        let chevron = NSImageView(frame: NSRect(x: 13, y: 12, width: 12, height: 12))
+        chevron.image = NSImage(systemSymbolName: "chevron.right", accessibilityDescription: expanded ? "Collapse" : "Expand")
+        chevron.contentTintColor = expanded ? providerBrandColor(provider) : menuTertiaryColor()
+        chevron.wantsLayer = true
+        chevron.layer?.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        chevron.frame = NSRect(x: 13, y: 12, width: 12, height: 12)   // re-apply after anchorPoint
+        let targetAngle: CGFloat = expanded ? -.pi / 2 : 0            // ▶ → ▼
+        chevron.layer?.setValue(targetAngle, forKeyPath: "transform.rotation.z")
         view.addSubview(chevron)
+        // Animate the spin only when this provider was just toggled open.
+        if justExpandedProvider == key {
+            let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+            spin.fromValue = 0
+            spin.toValue = targetAngle
+            spin.duration = 0.24
+            spin.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 0.61, 0.36, 1)
+            chevron.layer?.add(spin, forKey: "spin")
+        }
+        // Colour the chevron on hover; restore on exit (stays coloured if expanded).
+        let brand = providerBrandColor(provider)
+        let idle = menuTertiaryColor()
+        view.hoverHandler = { [weak chevron] hovering in
+            chevron?.contentTintColor = (hovering || expanded) ? brand : idle
+        }
         let symbol = providerSymbolName(provider.provider)
-        let image = NSImageView(frame: NSRect(x: 32, y: 25, width: 16, height: 16))
+        let image = NSImageView(frame: NSRect(x: 50, y: 17, width: 14, height: 14))
         image.image = NSImage(systemSymbolName: symbol, accessibilityDescription: provider.label)
         // Always the provider's own colour — even out of quota or offline — so the
         // row reads consistently; the status dot (red ring) flags any problem.
         image.contentTintColor = providerBrandColor(provider)
         view.addSubview(image)
-        view.addSubview(label(provider.label, frame: NSRect(x: 56, y: 26, width: 150, height: 18), font: .systemFont(ofSize: 13, weight: .semibold), color: providerBrandColor(provider)))
+        view.addSubview(label(provider.label, frame: NSRect(x: 70, y: 17, width: 130, height: 16), font: .systemFont(ofSize: 12, weight: .semibold), color: providerBrandColor(provider)))
         if let plan = provider.plan {
-            view.addSubview(label(plan.uppercased(), frame: NSRect(x: 200, y: 28, width: 90, height: 15), font: .systemFont(ofSize: 9, weight: .medium), color: menuTertiaryColor(), alignment: .right))
+            view.addSubview(label(plan.uppercased(), frame: NSRect(x: 196, y: 18, width: 94, height: 14), font: .systemFont(ofSize: 8.5, weight: .medium), color: menuTertiaryColor(), alignment: .right))
         }
         // A provider that just RESET swaps its status dot for a green reset icon and
         // leads its summary with "Quota back" for a few seconds (the pet waves too).
         let recovered = providerRecentlyRecovered(key)
-        let statusImage = NSImageView(frame: NSRect(x: recovered ? 320 : 322, y: 26, width: recovered ? 17 : 14, height: recovered ? 17 : 14))
+        let statusImage = NSImageView(frame: NSRect(x: recovered ? 322 : 323, y: recovered ? 17 : 18, width: recovered ? 15 : 12, height: recovered ? 15 : 12))
         if recovered {
             statusImage.image = NSImage(systemSymbolName: "arrow.clockwise.circle.fill", accessibilityDescription: "Quota reset — available again")
             statusImage.contentTintColor = .hermesGreen
@@ -1372,24 +1566,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // collide with it; an out-of-quota row (no bar) gets the full width for its
         // longer "Resets in … · over limit" text.
         let summaryText = providerSummary(provider, connected: connected)
-        let barWillShow = connected && provider.status == "ok" && !providerIsExhausted(provider)
+        // Bar shows only for a connected, in-quota provider with a collapsed % — an
+        // out-of-quota row draws NO bar (a 0%-full bar is just noise) and gives the
+        // summary the full width for its longer "Resets … · over limit" text. When
+        // EXPANDED, the per-window rows below already show the bar + numbers, so the
+        // header drops its own summary bar to avoid a doubled usage graph — it keeps
+        // only the brief text line.
+        let barWillShow = !expanded && connected && provider.status == "ok" && !providerIsExhausted(provider)
             && collapsedRemainingPercent(provider) != nil
-        let summaryWidth: CGFloat = barWillShow ? 170 : 260
-        view.addSubview(label(summaryText, frame: NSRect(x: 56, y: 7, width: summaryWidth, height: 15), font: .systemFont(ofSize: 10.5), color: recovered ? .hermesGreen : menuSecondaryColor()))
+        let summaryWidth: CGFloat = barWillShow ? 156 : 250
+        view.addSubview(label(summaryText, frame: NSRect(x: 70, y: 2, width: summaryWidth, height: 14), font: .systemFont(ofSize: 9.5), color: recovered ? .hermesGreen : menuSecondaryColor()))
         // Bar tracks the collapsed %: the current-session window for %-based
         // providers (Codex/Claude); amount-only providers (OpenRouter) keep their
-        // existing bar via the min fallback. An OUT-OF-QUOTA provider draws NO bar
-        // (a 0%-full bar is just noise) — the summary carries its reset time
-        // instead, the same treatment as the expanded window rows.
+        // existing bar via the min fallback.
         if barWillShow, let minimum = collapsedRemainingPercent(provider) {
-            let track = NSView(frame: NSRect(x: 232, y: 11, width: 104, height: 6))
+            let track = NSView(frame: NSRect(x: 232, y: 6, width: 104, height: 5))
             track.wantsLayer = true
-            track.layer?.cornerRadius = 3
+            track.layer?.cornerRadius = 2.5
             track.layer?.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.28).cgColor
             let fillWidth = 104 * max(0, min(100, minimum)) / 100
-            let fill = NSView(frame: NSRect(x: 0, y: 0, width: fillWidth, height: 6))
+            let fill = NSView(frame: NSRect(x: 0, y: 0, width: fillWidth, height: 5))
             fill.wantsLayer = true
-            fill.layer?.cornerRadius = 3
+            fill.layer?.cornerRadius = 2.5
             fill.layer?.backgroundColor = barColor(for: provider, remainingPercent: minimum).cgColor
             track.addSubview(fill)
             view.addSubview(track)
@@ -1400,13 +1598,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.identifier = NSUserInterfaceItemIdentifier(key)
         button.target = self
         button.action = #selector(toggleProviderExpanded)
-        button.toolTip = expanded ? "Collapse \(provider.label)" : "Expand \(provider.label)"
+        button.setAccessibilityLabel(expanded ? "Collapse \(provider.label)" : "Expand \(provider.label)")
         view.addSubview(button)
         // Eye toggle: whether this provider's dot shows in the closed menu bar.
-        // Added AFTER the full-row expand button so it stays independently
-        // clickable on top of it.
+        // Placed on the LEFT, right after the collapse chevron, so the row's
+        // controls (chevron + eye) sit together. Added AFTER the full-row expand
+        // button so it stays independently clickable on top of it.
         let shown = providerShownInMenuBar(kind, provider.provider)
-        let eye = NSButton(frame: NSRect(x: 300, y: 24, width: 18, height: 18))
+        let eye = NSButton(frame: NSRect(x: 28, y: 10, width: 18, height: 18))
         eye.isBordered = false
         eye.title = ""
         eye.image = NSImage(systemSymbolName: shown ? "eye" : "eye.slash",
@@ -1417,7 +1616,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         eye.identifier = NSUserInterfaceItemIdentifier(key)
         eye.target = self
         eye.action = #selector(toggleProviderMenuBar(_:))
-        eye.toolTip = shown ? "Hide \(provider.label) from the menu bar" : "Show \(provider.label) in the menu bar"
+        eye.setAccessibilityLabel(shown ? "Hide \(provider.label) from the menu bar" : "Show \(provider.label) in the menu bar")
         view.addSubview(eye)
         return view
     }
@@ -1438,9 +1637,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         view.addSubview(dot)
         view.addSubview(label(name.uppercased(), frame: NSRect(x: 30, y: 8, width: 66, height: 14),
                               font: .systemFont(ofSize: 10, weight: .semibold), color: menuSecondaryColor()))
-        // The dot's colour already conveys the connection state; a row tooltip
-        // spells it out, so the width goes to clearly-labelled controls instead.
-        view.toolTip = "\(name) — \(source.connected ? "connected" : "disconnected")"
+        // The dot's colour already conveys the connection state, so the header
+        // carries no hover tooltip — the width goes to clearly-labelled controls
+        // instead.
 
         // Right-aligned cluster of this source's own controls — plain, uniform icon
         // buttons: a per-SOURCE Refresh, the pet (paw toggle + its picture to
@@ -1522,7 +1721,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.target = self
         button.action = action
         if let key { button.identifier = NSUserInterfaceItemIdentifier(key) }
-        button.toolTip = tooltip
+        button.setAccessibilityLabel(tooltip)
         return button
     }
 
@@ -1596,6 +1795,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return provider.windows.first
     }
 
+    // The weekly window — Claude's "Current week" / Codex's "Weekly". The longer
+    // window that ultimately gates usage once a session is spent.
+    private func weeklyWindow(_ provider: QuotaProvider) -> QuotaWindow? {
+        provider.windows.first { $0.label.lowercased().contains("week") }
+    }
+
+    // Whether the session window should be HIDDEN for this provider. Rule: hide
+    // the session ONLY when the WEEKLY is over limit — then the session is moot
+    // until the weekly resets, so show the weekly alone. When the SESSION is the
+    // one that's capped but the weekly still has room, KEEP the session: its reset
+    // time is exactly what you're waiting for to get unblocked (e.g. a spent Codex
+    // 5h window that resets in a couple of hours while the weekly is fine).
+    private func hideSessionWindow(_ provider: QuotaProvider) -> Bool {
+        guard weeklyWindow(provider) != nil else { return false }
+        return weeklyWindow(provider)?.limitReached ?? false
+    }
+
+    // The windows to actually display for a provider, after applying the
+    // session/weekly over-limit suppression. Non-session/weekly windows (e.g. the
+    // per-model Opus/Sonnet weeks) are always kept.
+    private func displayWindows(_ provider: QuotaProvider) -> [QuotaWindow] {
+        guard hideSessionWindow(provider), let session = sessionWindow(provider) else {
+            return provider.windows
+        }
+        return provider.windows.filter { $0.label != session.label }
+    }
+
     // Remaining % of the current-session window (nil for amount-only providers
     // like OpenRouter, whose collapsed row shows a $ amount instead).
     private func sessionRemainingPercent(_ provider: QuotaProvider) -> Double? {
@@ -1603,7 +1829,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func collapsedRemainingPercent(_ provider: QuotaProvider) -> Double? {
-        provider.windows.filter(\.limitReached).compactMap(\.remainingPercent).min()
+        // When the session is suppressed (session or weekly over limit), the
+        // collapsed bar tracks the WEEKLY window — the number that now matters —
+        // instead of the spent session's 0%.
+        if hideSessionWindow(provider), let weekly = weeklyWindow(provider)?.remainingPercent {
+            return weekly
+        }
+        return provider.windows.filter(\.limitReached).compactMap(\.remainingPercent).min()
             ?? sessionRemainingPercent(provider)
             ?? providerMinimum(provider)
     }
@@ -1663,6 +1895,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case "openrouter":                                 return "openrouter"
         case "opencode":                                   return "opencode"
         case "copilot", "copilot-acp", "github-copilot":   return "copilot"
+        case "antigravity", "agy":                          return "antigravity"
         default:                                           return slug.lowercased()
         }
     }
@@ -1674,6 +1907,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case "anthropic":    return "#d97757"   // orange
         case "openai-codex": return "#10a37f"   // green
         case "copilot":      return "#6e7681"   // grey
+        case "antigravity":  return "#4285f4"
         default:             return "#8e8e93"   // unknown → neutral grey
         }
     }
@@ -1684,6 +1918,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case "opencode":     return "opencode"
         case "anthropic":    return "Claude"
         case "openai-codex": return "Codex"
+        case "antigravity":  return "Antigravity"
         default:             return slug.replacingOccurrences(of: "-", with: " ").replacingOccurrences(of: "_", with: " ").capitalized
         }
     }
@@ -1693,6 +1928,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case "openrouter": return "arrow.triangle.branch"
         case "opencode":   return "terminal"
         case "anthropic":  return "sparkles"
+        case "antigravity": return "atom"
         default:           return "chevron.left.forwardslash.chevron.right"   // Codex / other
         }
     }
@@ -1802,6 +2038,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard provider.status == "ok" else {
             return provider.status.replacingOccurrences(of: "_", with: " ").capitalized
         }
+        // Session/weekly over-limit rule: once the session is spent (or the weekly
+        // itself is out), the session number is moot — summarise from the WEEKLY
+        // window instead of flagging the whole provider "over limit" off the spent
+        // session. If the weekly is the one that's out, say so with ITS reset.
+        if hideSessionWindow(provider), let weekly = weeklyWindow(provider), let pct = weekly.remainingPercent {
+            if weekly.limitReached {
+                if let resetsAt = weekly.resetsAt, let reset = relativeReset(resetsAt) {
+                    return "Weekly over limit · resets \(reset)"
+                }
+                return "Weekly over limit"
+            }
+            let base = "\(Int(pct.rounded()))% week left"
+            if let resetsAt = weekly.resetsAt, let reset = relativeReset(resetsAt) {
+                return "\(base) · resets \(reset)"
+            }
+            return base
+        }
         let reached = provider.windows.filter(\.limitReached)
         if !reached.isEmpty {
             // Out of quota (yellow ring). Reset FIRST (so it never gets truncated off
@@ -1845,11 +2098,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return base
         }
         return "Quota available"
-    }
-
-    // Flattened (source, provider) pairs across all enabled sources.
-    private func allEntries() -> [(kind: GatewayKind, connected: Bool, provider: QuotaProvider)] {
-        sources.flatMap { source in source.providers.map { (source.kind, source.connected, $0) } }
     }
 
     private func statusDotsImage() -> NSImage {
@@ -1899,20 +2147,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return image
     }
 
-    private func statusTooltip() -> String {
-        let entries = allEntries()
-        guard !entries.isEmpty else {
-            if needsLogin || enabledGateways().isEmpty { return connectionSummary() }
-            return refreshing ? "Loading provider quotas" : "Provider quotas unavailable"
-        }
-        let multi = sources.count > 1
-        let providerText = entries.map { e in
-            let prefix = multi ? "\(sourceName(e.kind)) " : ""
-            return "\(prefix)\(e.provider.label): \(providerSummary(e.provider, connected: e.connected))"
-        }.joined(separator: " · ")
-        return "\(connectionSummary()) · \(providerText)"
-    }
-
     // One-liner for the header / tooltips summarising the enabled sources.
     private func connectionSummary() -> String {
         let enabled = enabledGateways()
@@ -1929,7 +2163,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func windowView(_ window: QuotaWindow, provider: QuotaProvider) -> NSView {
-        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 66))
         let value = window.remainingPercent ?? 0
         let hasValue = window.remainingPercent != nil || window.remainingAmount != nil
         // The progress bar carries the PROVIDER's brand colour (red when
@@ -1938,7 +2171,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let low = window.remainingPercent.map { $0 <= 15 } ?? false
         let bar = hasValue ? barColor(for: provider, remainingPercent: window.remainingPercent) : NSColor.tertiaryLabelColor
         let valueColor: NSColor = hasValue ? (window.limitReached ? NSColor.hermesRed : low ? NSColor.hermesOrange : menuPrimaryColor()) : menuTertiaryColor()
-        view.addSubview(label(window.label, frame: NSRect(x: 28, y: 40, width: 170, height: 18), font: .systemFont(ofSize: 12, weight: .medium)))
         let displayValue: String
         if let amount = window.remainingAmount {
             displayValue = "\(formattedAmount(amount, currency: window.currency)) available"
@@ -1947,38 +2179,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             displayValue = "Unavailable"
         }
-        view.addSubview(label(displayValue, frame: NSRect(x: 190, y: 39, width: 150, height: 19), font: .monospacedDigitSystemFont(ofSize: 12, weight: .semibold), color: valueColor, alignment: .right))
 
         if window.limitReached {
-            // OUT OF LIMIT: a 0%-full bar carries no information, so drop it. Give
-            // the freed space to what actually matters when a window is blocked —
-            // a PRECISE reset countdown (down to minutes, not the coarse "in 4h"),
-            // and, unless this IS the weekly window, how much WEEKLY quota you still
-            // have, since that's the real ceiling while this window is spent.
-            let resetLine: String
-            if let precise = preciseCountdown(window.resetsAt), let date = parsedDate(window.resetsAt) {
-                resetLine = "Resets in \(precise) · \(date.formatted(date: .abbreviated, time: .shortened))"
-            } else {
-                resetLine = "No reset time reported"
-            }
-            view.addSubview(label(resetLine, frame: NSRect(x: 28, y: 22, width: 312, height: 16), font: .systemFont(ofSize: 11, weight: .medium), color: menuPrimaryColor()))
+            // OUT OF LIMIT: keep it minimal — the window's "Limit reached" state, its
+            // reset countdown, and (unless this IS the weekly) how much weekly quota
+            // remains. No 0%-full bar, no absolute date, no reset suffix on the
+            // weekly line — just the three things that matter.
+            let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 58))
+            view.addSubview(label(window.label, frame: NSRect(x: 28, y: 36, width: 170, height: 16), font: .systemFont(ofSize: 12, weight: .medium)))
+            view.addSubview(label("Limit reached", frame: NSRect(x: 190, y: 35, width: 150, height: 17), font: .monospacedDigitSystemFont(ofSize: 12, weight: .semibold), color: valueColor, alignment: .right))
+            let resetLine = preciseCountdown(window.resetsAt).map { "Resets in \($0)" } ?? "No reset time reported"
+            view.addSubview(label(resetLine, frame: NSRect(x: 28, y: 19, width: 312, height: 15), font: .systemFont(ofSize: 11, weight: .medium), color: menuPrimaryColor()))
             if let weekly = weeklyWindow(provider), weekly.label != window.label, let pct = weekly.remainingPercent {
-                let resetSuffix = preciseCountdown(weekly.resetsAt).map { " · resets in \($0)" } ?? ""
                 let weeklyColor: NSColor = weekly.limitReached ? .hermesRed : (pct <= 15 ? .hermesOrange : menuSecondaryColor())
-                view.addSubview(label("Weekly: \(Int(pct.rounded()))% left\(resetSuffix)", frame: NSRect(x: 28, y: 4, width: 312, height: 16), font: .systemFont(ofSize: 10.5, weight: .medium), color: weeklyColor))
+                view.addSubview(label("Weekly: \(Int(pct.rounded()))% left", frame: NSRect(x: 28, y: 3, width: 312, height: 15), font: .systemFont(ofSize: 10.5, weight: .medium), color: weeklyColor))
             }
             return view
         }
 
+        // In-quota: compact row — label + value, a thin bar, and a subtitle.
+        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 42))
+        view.addSubview(label(window.label, frame: NSRect(x: 28, y: 25, width: 170, height: 15), font: .systemFont(ofSize: 11, weight: .medium)))
+        view.addSubview(label(displayValue, frame: NSRect(x: 190, y: 24, width: 150, height: 16), font: .monospacedDigitSystemFont(ofSize: 11, weight: .semibold), color: valueColor, alignment: .right))
         if window.remainingPercent != nil {
-            let track = NSView(frame: NSRect(x: 28, y: 26, width: 312, height: 6))
+            let track = NSView(frame: NSRect(x: 28, y: 15, width: 312, height: 5))
             track.wantsLayer = true
-            track.layer?.cornerRadius = 3
+            track.layer?.cornerRadius = 2.5
             track.layer?.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.28).cgColor
             let fillWidth = 312 * max(0, min(100, value)) / 100
-            let fill = NSView(frame: NSRect(x: 0, y: 0, width: fillWidth, height: 6))
+            let fill = NSView(frame: NSRect(x: 0, y: 0, width: fillWidth, height: 5))
             fill.wantsLayer = true
-            fill.layer?.cornerRadius = 3
+            fill.layer?.cornerRadius = 2.5
             fill.layer?.backgroundColor = bar.cgColor
             track.addSubview(fill)
             view.addSubview(track)
@@ -1993,7 +2224,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             subtitle = "No reset time reported"
         }
-        view.addSubview(label(subtitle, frame: NSRect(x: 28, y: 4, width: 312, height: 17), font: .systemFont(ofSize: 10.5), color: menuSecondaryColor()))
+        view.addSubview(label(subtitle, frame: NSRect(x: 28, y: 2, width: 312, height: 13), font: .systemFont(ofSize: 9.5), color: menuSecondaryColor()))
         return view
     }
 
@@ -2008,11 +2239,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if days > 0 { return "\(days)d \(hours)h" }
         if hours > 0 { return "\(hours)h \(mins)m" }
         return "\(max(1, mins))m"
-    }
-
-    // The provider's weekly window, if it reports one (label mentions "week").
-    private func weeklyWindow(_ provider: QuotaProvider) -> QuotaWindow? {
-        provider.windows.first { $0.label.lowercased().contains("week") }
     }
 
     private func detailView(_ detail: String) -> NSView {
@@ -2067,7 +2293,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.image = image
         button.imagePosition = .imageOnly
         button.imageScaling = .scaleProportionallyDown
-        button.toolTip = label
         button.setAccessibilityLabel(label)
         button.glowColor = glowColor
         return button
@@ -2078,12 +2303,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // The sources are configured by the user via a multi-select dropdown — Hermes
     // (the gateway) and Local (locally-authenticated providers), both OFF by
     // default. The "Sources" row is a disclosure: click it to expand a checkbox per
-    // source (rendered by rebuildMenu as sourceOptionRow), so you can activate one
+    // source (rendered by rebuildMenu as sourceOptionsRow), so you can activate one
     // or BOTH and it STAYS OPEN while you toggle. No fallback — deselecting a source
     // drops its providers.
     private func gatewayRowView() -> NSView {
-        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 40))
         let enabled = enabledGateways()
+        // Plain row — no hover/border effect (the disclosure just toggles the chips
+        // below). Keeps click-to-expand without the selection outline.
+        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 40))
         let icon = NSImageView(frame: NSRect(x: 16, y: 12, width: 16, height: 16))
         icon.image = NSImage(systemSymbolName: "network", accessibilityDescription: nil)
         icon.contentTintColor = enabled.isEmpty ? .tertiaryLabelColor : (anyConnected ? .hermesBlue : .hermesRed)
@@ -2095,11 +2322,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Right-aligned summary of what's active + a disclosure chevron. A plain
         // NSButton in the row (reliable — nested NSMenus don't work inside a
         // status-bar menu, which is why the old pull-down didn't respond).
+        // Closed Sources row: don't spell out the active source NAMES (they're in
+        // the expanded chips). When nothing is active, keep a "Select…" prompt;
+        // otherwise show a small status dot per active source as a glanceable hint.
         let active = Self.sourceOrder.filter { gatewayEnabled($0) }
-        let summary = active.isEmpty ? "Select…" : active.map { sourceName($0) }.joined(separator: ", ")
-        view.addSubview(label(summary, frame: NSRect(x: 176, y: 12, width: 150, height: 16),
-                              font: .systemFont(ofSize: 12), color: active.isEmpty ? menuTertiaryColor() : menuSecondaryColor(),
-                              alignment: .right))
+        if active.isEmpty {
+            view.addSubview(label("Select…", frame: NSRect(x: 176, y: 12, width: 150, height: 16),
+                                  font: .systemFont(ofSize: 12), color: menuTertiaryColor(), alignment: .right))
+        } else {
+            // Dots laid out right-to-left, ending just left of the chevron.
+            var dx: CGFloat = 322
+            for kind in active.reversed() {
+                let connected = sources.first { $0.kind == kind }?.connected ?? false
+                let loading = activating.contains(kind)
+                let color: NSColor = loading ? .hermesBlue : (connected ? .hermesGreen : .hermesRed)
+                let d = NSImageView(frame: NSRect(x: dx, y: 15, width: 9, height: 9))
+                d.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: nil)
+                d.contentTintColor = color
+                d.imageScaling = .scaleProportionallyDown
+                view.addSubview(d)
+                dx -= 14
+            }
+        }
         let chevron = NSImageView(frame: NSRect(x: 334, y: 13, width: 12, height: 14))
         chevron.image = NSImage(systemSymbolName: sourcesExpanded ? "chevron.up" : "chevron.down", accessibilityDescription: nil)
         chevron.contentTintColor = menuTertiaryColor()
@@ -2112,7 +2356,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.title = ""
         button.target = self
         button.action = #selector(toggleSourcesExpanded)
-        button.toolTip = sourcesExpanded ? "Hide sources" : "Choose which sources are active"
+        button.setAccessibilityLabel(sourcesExpanded ? "Hide sources" : "Choose which sources are active")
         view.addSubview(button)
         return view
     }
@@ -2123,56 +2367,87 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         applyMenuWindowAppearance()
     }
 
-    // One expanded row per source, styled as an ACTIVATION SECTION (not a checkbox):
-    // a rounded chip that FILLS with the source's status colour when active and sits
-    // as a plain outline when off. A leading status dot + a right-aligned state label
-    // ("Active" / "Activating…" / "Not signed in" / "Off") make the state obvious.
-    // The whole row toggles the source and the menu stays open, so you can activate
-    // one or both.
-    private func sourceOptionRow(_ kind: GatewayKind) -> NSView {
-        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 34))
+    // The source toggles laid out SIDE BY SIDE in one row (was one full-width row
+    // per source stacked vertically, which wasted space). Each source is a compact
+    // chip — status dot + name + state — that fills with its status colour when
+    // active and highlights on hover; clicking it toggles that source and the menu
+    // stays open, so you can activate one or both.
+    private func sourceOptionsRow() -> NSView {
+        let row = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 42))
+        let kinds = Self.sourceOrder
+        let sideInset: CGFloat = 16, gap: CGFloat = 8
+        let totalW = 360 - sideInset * 2 - gap * CGFloat(kinds.count - 1)
+        let chipW = totalW / CGFloat(kinds.count)
+        for (index, kind) in kinds.enumerated() {
+            let x = sideInset + CGFloat(index) * (chipW + gap)
+            row.addSubview(sourceChip(kind, frame: NSRect(x: x, y: 5, width: chipW, height: 32)))
+        }
+        return row
+    }
+
+    private func sourceChip(_ kind: GatewayKind, frame: NSRect) -> NSView {
         let on = gatewayEnabled(kind)
         let loading = activating.contains(kind)
         let connected = sources.first { $0.kind == kind }?.connected ?? false
         // Accent = the state colour: blue while activating, green connected, red
-        // signed-out; grey when the section is off.
+        // signed-out; grey when the source is off.
         let accent: NSColor = !on ? .tertiaryLabelColor
             : loading ? .hermesBlue
             : connected ? .hermesGreen : .hermesRed
+        let active = on && connected && !loading
 
-        let chip = NSView(frame: NSRect(x: 38, y: 4, width: 306, height: 26))
-        chip.wantsLayer = true
-        chip.layer?.cornerRadius = 7
-        chip.layer?.backgroundColor = (on ? accent.withAlphaComponent(0.16) : NSColor.clear).cgColor
-        chip.layer?.borderColor = (on ? accent.withAlphaComponent(0.55)
-                                      : NSColor.separatorColor.withAlphaComponent(0.55)).cgColor
-        chip.layer?.borderWidth = 1
-        view.addSubview(chip)
+        // The chip is a hover row so it GLOWS on hover; a soft accent-tinted pill
+        // sits behind for the badge look (no border at rest — only on hover).
+        let chip = hoverRow(frame, tint: accent, persistent: false)
+        chip.hoverGlow = true
+        let bg = NSView(frame: NSRect(x: 6, y: 2, width: frame.width - 12, height: frame.height - 4))
+        bg.wantsLayer = true
+        bg.layer?.cornerRadius = 9
+        bg.layer?.backgroundColor = (on ? accent.withAlphaComponent(0.16)
+                                        : NSColor.secondaryLabelColor.withAlphaComponent(0.08)).cgColor
+        chip.addSubview(bg)
 
-        let dot = NSImageView(frame: NSRect(x: 50, y: 12, width: 10, height: 10))
+        let dot = NSImageView(frame: NSRect(x: 16, y: (frame.height - 10) / 2, width: 10, height: 10))
         dot.image = NSImage(systemSymbolName: on ? "circle.fill" : "circle", accessibilityDescription: nil)
         dot.contentTintColor = on ? accent : menuTertiaryColor()
         dot.imageScaling = .scaleProportionallyDown
-        view.addSubview(dot)
+        chip.addSubview(dot)
 
-        view.addSubview(label(sourceName(kind), frame: NSRect(x: 68, y: 9, width: 150, height: 16),
+        chip.addSubview(label(sourceName(kind), frame: NSRect(x: 34, y: (frame.height - 15) / 2, width: frame.width - 100, height: 15),
                               font: .systemFont(ofSize: 12, weight: on ? .semibold : .regular),
                               color: on ? menuPrimaryColor() : menuSecondaryColor()))
 
-        let state = !on ? "Off" : loading ? "Activating…" : connected ? "Active" : "Not signed in"
-        view.addSubview(label(state, frame: NSRect(x: 196, y: 9, width: 140, height: 16),
-                              font: .systemFont(ofSize: 10.5, weight: .medium),
-                              color: on ? accent : menuTertiaryColor(), alignment: .right))
+        // ACTIVE reads as just a green point on the right (no "Active" text). Other
+        // states keep a small labelled pill so you know what a tap will do.
+        if active {
+            let point = NSImageView(frame: NSRect(x: frame.width - 24, y: (frame.height - 10) / 2, width: 10, height: 10))
+            point.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: "Active")
+            point.contentTintColor = .hermesGreen
+            point.imageScaling = .scaleProportionallyDown
+            chip.addSubview(point)
+        } else {
+            let state = !on ? "Off" : loading ? "Activating" : "Sign in"
+            let pillW: CGFloat = 62
+            let statePill = NSView(frame: NSRect(x: frame.width - pillW - 12, y: (frame.height - 17) / 2, width: pillW, height: 17))
+            statePill.wantsLayer = true
+            statePill.layer?.cornerRadius = 8.5
+            statePill.layer?.backgroundColor = (on ? accent.withAlphaComponent(0.9)
+                                                   : NSColor.secondaryLabelColor.withAlphaComponent(0.14)).cgColor
+            statePill.addSubview(label(state, frame: NSRect(x: 0, y: 1, width: pillW, height: 14),
+                                       font: .systemFont(ofSize: 9, weight: .semibold),
+                                       color: on ? .white : menuTertiaryColor(), alignment: .center))
+            chip.addSubview(statePill)
+        }
 
-        let button = NSButton(frame: view.bounds)
+        let button = NSButton(frame: chip.bounds)
         button.isBordered = false
         button.title = ""
         button.identifier = NSUserInterfaceItemIdentifier(kind.rawValue)
         button.target = self
         button.action = #selector(toggleGatewayEnabled(_:))
-        button.toolTip = on ? "Deactivate \(sourceName(kind))" : "Activate \(sourceName(kind))"
-        view.addSubview(button)
-        return view
+        button.setAccessibilityLabel(on ? "Deactivate \(sourceName(kind))" : "Activate \(sourceName(kind))")
+        chip.addSubview(button)
+        return chip
     }
 
     // App-only appearance override, independent of the rest of macOS. nil/"system"
@@ -2428,7 +2703,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         addView(titleView())
         addView(gatewayRowView())
         if sourcesExpanded {
-            for kind in Self.sourceOrder { addView(sourceOptionRow(kind)) }
+            addView(sourceOptionsRow())
         }
         let enabled = enabledGateways()
         if enabled.isEmpty {
@@ -2454,20 +2729,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     let ordered = source.providers.filter { providerShownInMenuBar(source.kind, $0.provider) }
                         + source.providers.filter { !providerShownInMenuBar(source.kind, $0.provider) }
                     for provider in ordered {
-                        addView(providerView(provider, kind: source.kind, connected: source.connected))
-                        // Collapsed by default; expand to see per-window detail. A
-                        // hidden provider is never expanded — its row isn't expandable.
-                        guard providerShownInMenuBar(source.kind, provider.provider),
-                              expandedProviders.contains(providerKey(source.kind, provider.provider)) else { continue }
-                        if provider.windows.isEmpty {
-                            addView(messageView(provider.message ?? provider.status.replacingOccurrences(of: "_", with: " "), color: .hermesOrange))
+                        let isExpanded = providerShownInMenuBar(source.kind, provider.provider)
+                            && expandedProviders.contains(providerKey(source.kind, provider.provider))
+                        // Collapsed / hidden providers are one self-contained bordered
+                        // row each.
+                        if !isExpanded {
+                            addView(providerView(provider, kind: source.kind, connected: source.connected))
+                            continue
                         }
-                        for window in provider.windows {
-                            addView(windowView(window, provider: provider))
+                        // EXPANDED: render the provider header + its window/detail rows
+                        // as ONE menu item inside a single container that draws ONE
+                        // enclosing border. Stitching a border across separate menu
+                        // items left gaps that read as the border "wrapping"; one
+                        // container is a single clean rounded outline.
+                        let tint = providerBrandColor(provider)
+                        let header = providerView(provider, kind: source.kind, connected: source.connected)
+                        if let h = header as? HoverRowView {
+                            h.persistent = false      // the container draws the border, not the header
+                            h.respondsToHover = false
+                        }
+                        var rows: [NSView] = [header]
+                        if provider.windows.isEmpty {
+                            rows.append(messageView(provider.message ?? provider.status.replacingOccurrences(of: "_", with: " "), color: .hermesOrange))
+                        }
+                        for window in displayWindows(provider) {
+                            rows.append(windowView(window, provider: provider))
                         }
                         for detail in provider.details {
-                            addView(detailView(detail))
+                            rows.append(detailView(detail))
                         }
+                        let rowsH = rows.reduce(CGFloat(0)) { $0 + $1.frame.height }
+                        // A little breathing room at top/bottom of the section.
+                        let vPad: CGFloat = 6
+                        let totalH = rowsH + vPad * 2
+                        // No enclosing border. The expanded state is marked by a
+                        // VERTICAL accent line down the left of the section in the
+                        // provider's colour. When THIS provider was just clicked open,
+                        // it animates: the accent grows downward and the content fades
+                        // + slides up a touch — a quick, smooth unfold (not on reopen).
+                        let animate = justExpandedProvider == providerKey(source.kind, provider.provider)
+                        let container = hoverRow(NSRect(x: 0, y: 0, width: 360, height: totalH), tint: tint, persistent: false)
+                        container.respondsToHover = false
+                        container.drawsBorder = false
+                        container.wantsLayer = true
+                        let accent = CALayer()
+                        accent.backgroundColor = tint.cgColor
+                        accent.cornerRadius = 1.5
+                        accent.anchorPoint = CGPoint(x: 0.5, y: 1)   // grow downward from the top
+                        accent.frame = CGRect(x: 8, y: 4, width: 3, height: totalH - 8)
+                        container.layer?.addSublayer(accent)
+                        // Stack the rows top-to-bottom inside the container (NSView is
+                        // non-flipped, so the first row sits at the highest y), inset by
+                        // the vertical padding.
+                        var y = totalH - vPad
+                        for v in rows {
+                            y -= v.frame.height
+                            v.frame = NSRect(x: 0, y: y, width: 360, height: v.frame.height)
+                            container.addSubview(v)
+                        }
+                        if animate {
+                            let timing = CAMediaTimingFunction(controlPoints: 0.22, 0.61, 0.36, 1)  // easeOutCubic-ish
+                            let grow = CABasicAnimation(keyPath: "transform.scale.y")
+                            grow.fromValue = 0
+                            grow.toValue = 1
+                            grow.duration = 0.26
+                            grow.timingFunction = timing
+                            accent.add(grow, forKey: "grow")
+                            // Content: fade in + slide up ~6px, quickly.
+                            container.wantsLayer = true
+                            container.layer?.opacity = 1
+                            let fade = CABasicAnimation(keyPath: "opacity")
+                            fade.fromValue = 0
+                            fade.toValue = 1
+                            fade.duration = 0.2
+                            fade.timingFunction = timing
+                            container.layer?.add(fade, forKey: "fade")
+                            let slide = CABasicAnimation(keyPath: "transform.translation.y")
+                            slide.fromValue = -6
+                            slide.toValue = 0
+                            slide.duration = 0.26
+                            slide.timingFunction = timing
+                            container.layer?.add(slide, forKey: "slide")
+                        }
+                        addView(container)
                     }
                 } else {
                     // Disconnected source: don't list individual providers or any
@@ -2478,6 +2822,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         addView(actionBarView())
+        // The one-shot expand animation has now been applied — clear it so a later
+        // rebuild/reopen doesn't re-animate the already-open section.
+        justExpandedProvider = nil
     }
 
     // Shown in place of a source's block while it's activating (just switched on,
@@ -3352,8 +3699,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let provider = sender.identifier?.rawValue else { return }
         if expandedProviders.contains(provider) {
             expandedProviders.remove(provider)
+            justExpandedProvider = nil
         } else {
             expandedProviders.insert(provider)
+            justExpandedProvider = provider   // animate only this one, only now
         }
         rebuildMenu()
     }
@@ -3449,7 +3798,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         process.standardError = errors
         do {
             try process.run()
-            process.waitUntilExit()
+            // Guard against a wedged reader stalling the whole source (which made
+            // a fast provider like Claude lag behind a slow/hung one): kill the
+            // helper if it outruns this budget and treat it as a failed fetch.
+            let deadline = DispatchTime.now() + .seconds(20)
+            let done = DispatchSemaphore(value: 0)
+            DispatchQueue.global(qos: .utility).async {
+                process.waitUntilExit()
+                done.signal()
+            }
+            if done.wait(timeout: deadline) == .timedOut {
+                process.terminate()
+                throw NSError(domain: "ProviderQuotaMenuBar", code: Int(ETIMEDOUT), userInfo: [NSLocalizedDescriptionKey: "\(name) timed out"])
+            }
             let data = output.fileHandleForReading.readDataToEndOfFile()
             if process.terminationStatus != 0 {
                 let errorData = errors.fileHandleForReading.readDataToEndOfFile()
