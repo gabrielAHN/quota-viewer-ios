@@ -24,6 +24,7 @@
 set -euo pipefail
 exec /usr/bin/env python3 - "$@" <<'PY'
 import base64, json, os, subprocess, sys, time, urllib.request, urllib.error
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -85,6 +86,178 @@ def _provider(provider, label, status, windows, source=None, plan=None, details=
         "details": details or [],
         "message": message,
     }
+
+
+def _antigravity_cli():
+    candidates = [
+        HOME / ".local" / "bin" / "agy",
+        Path("/opt/homebrew/bin/agy"),
+        Path("/usr/local/bin/agy"),
+    ]
+    path_dirs = [Path(value) for value in os.environ.get("PATH", "").split(os.pathsep) if value]
+    candidates.extend(directory / "agy" for directory in path_dirs)
+    return next((path for path in candidates if path.is_file() and os.access(path, os.X_OK)), None)
+
+
+def _antigravity_secret(value):
+    if not value:
+        return None
+    raw = value.strip()
+    prefix = b"go-keyring-base64:"
+    if raw.startswith(prefix):
+        try:
+            raw = base64.b64decode(raw[len(prefix):], validate=True)
+        except Exception:
+            return None
+    try:
+        return json.loads(raw.decode())
+    except Exception:
+        return None
+
+
+def _antigravity_credentials():
+    try:
+        raw = subprocess.check_output(
+            ["security", "find-generic-password", "-a", "antigravity", "-s", "gemini", "-w"],
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        data = _antigravity_secret(raw)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    path = HOME / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _antigravity_access_token(credentials, cli):
+    token = credentials.get("token") if isinstance(credentials.get("token"), dict) else credentials
+    access_token = token.get("access_token") if isinstance(token, dict) else None
+    expiry = token.get("expiry") if isinstance(token, dict) else None
+    if isinstance(access_token, str) and access_token:
+        try:
+            expires = datetime.fromisoformat(str(expiry).replace("Z", "+00:00"))
+            if expires > datetime.now(timezone.utc) + timedelta(seconds=60):
+                return access_token
+        except Exception:
+            pass
+    if cli is not None:
+        try:
+            subprocess.run(
+                [str(cli), "models"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=8,
+                check=False,
+            )
+            refreshed = _antigravity_credentials() or {}
+            refreshed_token = refreshed.get("token") if isinstance(refreshed.get("token"), dict) else refreshed
+            refreshed_access = refreshed_token.get("access_token") if isinstance(refreshed_token, dict) else None
+            if isinstance(refreshed_access, str) and refreshed_access:
+                return refreshed_access
+        except Exception:
+            pass
+    return access_token if isinstance(access_token, str) and access_token else None
+
+
+def _antigravity_fraction(bucket):
+    for source in (bucket, bucket.get("remaining")):
+        if not isinstance(source, dict):
+            continue
+        for key in ("remainingFraction", "remaining_fraction"):
+            value = source.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return max(0.0, min(1.0, float(value)))
+            if isinstance(value, str):
+                try:
+                    return max(0.0, min(1.0, float(value)))
+                except ValueError:
+                    pass
+        if source.get("case") == "remainingFraction":
+            try:
+                return max(0.0, min(1.0, float(source.get("value"))))
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def _antigravity_windows(payload):
+    root = payload if isinstance(payload, dict) else {}
+    groups = root.get("groups")
+    if not isinstance(groups, list):
+        for key in ("response", "summary"):
+            nested = root.get(key)
+            if isinstance(nested, dict) and isinstance(nested.get("groups"), list):
+                groups = nested["groups"]
+                break
+    if not isinstance(groups, list):
+        return []
+    windows = []
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        name = str(group.get("displayName") or group.get("name") or "Models").strip()
+        lower_name = name.lower()
+        family = "Gemini" if "gemini" in lower_name else "Claude/GPT" if "claude" in lower_name or "gpt" in lower_name else name.title()
+        buckets = group.get("buckets")
+        if not isinstance(buckets, list):
+            continue
+        for bucket in buckets:
+            if not isinstance(bucket, dict):
+                continue
+            disabled = bucket.get("disabled")
+            if disabled is True or str(disabled).lower() in ("1", "true"):
+                continue
+            fraction = _antigravity_fraction(bucket)
+            if fraction is None:
+                continue
+            identity = " ".join(str(bucket.get(key) or "") for key in ("bucketId", "id", "displayName", "name", "window")).lower()
+            period = "Weekly" if "week" in identity or "7d" in identity or "seven" in identity else "Session" if "session" in identity or "hour" in identity or "5" in identity else str(bucket.get("displayName") or bucket.get("name") or "Quota").strip()
+            reset = next((bucket.get(key) for key in ("resetTime", "reset_time", "resetAt", "reset_at") if bucket.get(key)), None)
+            remaining = fraction * 100.0
+            windows.append(_window(f"{family} {period.lower()}", 100.0 - remaining, resets_at=reset, detail=f"{remaining:.0f}% left"))
+    return windows
+
+
+def antigravity_provider():
+    cli = _antigravity_cli()
+    credentials = _antigravity_credentials()
+    if cli is None and credentials is None:
+        return None
+    if credentials is None:
+        return _provider("antigravity", "Antigravity", "unavailable", [], message="Antigravity is installed — run `agy` to sign in.")
+    token = _antigravity_access_token(credentials, cli)
+    if not token:
+        return _provider("antigravity", "Antigravity", "unavailable", [], message="Antigravity sign-in expired — run `agy` to sign in again.")
+    request = urllib.request.Request(
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+        data=b"{}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "antigravity/1.2.0 Darwin/arm64",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return _provider("antigravity", "Antigravity", "unavailable", [], message="Antigravity sign-in expired — run `agy` to sign in again.")
+        return _provider("antigravity", "Antigravity", "unavailable", [], message=f"Antigravity usage error (HTTP {exc.code}).")
+    except Exception as exc:
+        return _provider("antigravity", "Antigravity", "unavailable", [], message=f"Could not reach Antigravity usage: {exc}")
+    windows = _antigravity_windows(payload)
+    if not windows:
+        return _provider("antigravity", "Antigravity", "unavailable", [], message="Antigravity did not report quota windows.")
+    plan = credentials.get("plan_tier") or credentials.get("plan")
+    return _provider("antigravity", "Antigravity", "ok", windows, source="cloud_code_quota_api", plan=str(plan) if plan else None)
 
 
 # --- Claude (Anthropic OAuth usage) --------------------------------------------
@@ -354,9 +527,21 @@ def opencode_provider():
         "opencode's OpenRouter key was rejected — re-run `opencode auth login`.")
 
 
-providers = [p for p in (anthropic_provider(), codex_provider(), openrouter_provider(), opencode_provider()) if p is not None]
+_provider_fns = (anthropic_provider, codex_provider, antigravity_provider, openrouter_provider, opencode_provider)
+# Fetch every provider CONCURRENTLY. Each hits a different remote usage API (and
+# some, like Antigravity, shell out to a CLI), so running them sequentially made
+# a fast provider like Claude wait behind the slowest one — the source lagged as
+# a whole. A per-future guard keeps one provider's failure from sinking the rest.
+def _safe(fn):
+    try:
+        return fn()
+    except Exception:
+        return None
+
+with ThreadPoolExecutor(max_workers=len(_provider_fns)) as _pool:
+    providers = [p for p in _pool.map(_safe, _provider_fns) if p is not None]
 if not providers:
-    fail("Sign in to Claude, Codex, OpenRouter, or opencode to see quotas.")
+    fail("Sign in to Claude, Codex, Antigravity, OpenRouter, or opencode to see quotas.")
 
 print(json.dumps({
     "broker": os.uname().nodename,
