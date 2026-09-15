@@ -1541,7 +1541,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             chevron?.contentTintColor = (hovering || expanded) ? brand : idle
         }
         view.addSubview(label(provider.label, frame: NSRect(x: 70, y: expanded ? 5 : 17, width: 130, height: 16), font: .systemFont(ofSize: 12, weight: .semibold), color: providerBrandColor(provider)))
-        if let plan = provider.plan {
+        if let plan = displayPlan(provider) {
             view.addSubview(label(plan.uppercased(), frame: NSRect(x: 196, y: expanded ? 6 : 18, width: 94, height: 14), font: .systemFont(ofSize: 8.5, weight: .medium), color: menuTertiaryColor(), alignment: .right))
         }
         // A provider that just RESET swaps its status dot for a green reset icon and
@@ -1843,6 +1843,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func providerIsExhausted(_ provider: QuotaProvider) -> Bool {
         provider.status == "ok" && provider.windows.contains(where: \.limitReached)
     }
+
+    // The "Extra usage: 242.00 / 200.00 USD" overflow-spend line. It's noisy and
+    // easy to misread as a hard cap, so it's hidden from the expanded detail rows.
+    private func isExtraUsageDetail(_ detail: String) -> Bool {
+        detail.lowercased().hasPrefix("extra usage")
+    }
+
+    // The plan/tier badge shown at the right of a provider row. Prefer whatever the
+    // reader supplied; for Claude, fall back to the local Claude subscription
+    // (organizationType / rate-limit tier from ~/.claude.json) so a Team/Max/Pro
+    // subscription shows even when the gateway payload carries no plan.
+    private func displayPlan(_ provider: QuotaProvider) -> String? {
+        if let plan = provider.plan, !plan.isEmpty { return plan }
+        if Self.normalizedProvider(provider.provider) == "anthropic" {
+            return Self.claudeSubscriptionLabel
+        }
+        return nil
+    }
+
+    // Read once: Claude's subscription from ~/.claude.json's oauthAccount. Maps the
+    // organizationType / seatTier / rate-limit tier to a short badge (Team, Max, Pro).
+    static let claudeSubscriptionLabel: String? = {
+        let path = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude.json")
+        guard let data = try? Data(contentsOf: path),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let account = root["oauthAccount"] as? [String: Any] else { return nil }
+        let orgType = (account["organizationType"] as? String ?? "").lowercased()
+        let seat = (account["seatTier"] as? String ?? "").lowercased()
+        let tier = (account["userRateLimitTier"] as? String ?? "").lowercased()
+        if orgType.contains("team") || seat.contains("team") { return "Team" }
+        if orgType.contains("enterprise") { return "Enterprise" }
+        if tier.contains("max") { return "Max" }
+        if tier.contains("pro") { return "Pro" }
+        return nil
+    }()
 
     // After each fetch, diff every connected+ok provider's exhaustion against the
     // last reading. A provider that WAS out of quota and now has some again just
@@ -2745,7 +2780,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         for window in displayWindows(provider) {
                             rows.append(windowView(window, provider: provider))
                         }
-                        for detail in provider.details {
+                        for detail in provider.details where !isExtraUsageDetail(detail) {
                             rows.append(detailView(detail))
                         }
                         let rowsH = rows.reduce(CGFloat(0)) { $0 + $1.frame.height }
