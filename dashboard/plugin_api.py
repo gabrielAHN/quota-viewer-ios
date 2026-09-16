@@ -6,6 +6,7 @@ import re
 import socket
 import time
 import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -58,9 +59,34 @@ def _configured_providers() -> tuple[tuple[str, str], ...]:
 
 
 CACHE_SECONDS = 60
+# The shortest interval a forced ?refresh=true is allowed to actually hit upstream.
+# The menu-bar reader asks for a refresh on every poll (a few seconds apart); each
+# real refresh makes a live usage call per provider, and Anthropic's usage endpoint
+# 429s under that cadence — which core turns into None → "sign in", blanking a
+# provider that actually has quota. Keep forced refreshes from out-pacing upstream.
+_MIN_REFRESH_SECONDS = 30
 _cache: dict[str, Any] | None = None
 _cache_at = 0.0
 _lock = Lock()
+
+# Per-provider last-good snapshot: a successful reading kept so a TRANSIENT blip
+# (rate limit, 5xx, a momentary token-refresh gap) doesn't blank a provider that
+# actually has quota. Keyed by slug; also stamped with a monotonic time so a very
+# stale reading eventually gives way to the real error.
+_last_good: dict[str, dict[str, Any]] = {}
+_last_good_at: dict[str, float] = {}
+_LAST_GOOD_TTL = 15 * 60  # seconds
+
+
+class _TransientQuotaError(Exception):
+    """A recoverable upstream error (HTTP 429 / 5xx) — the credential is fine, the
+    provider API is just temporarily unavailable. Distinguished from a real auth
+    failure so the caller keeps the last-good reading instead of showing
+    signed-out."""
+
+    def __init__(self, code: int) -> None:
+        super().__init__(f"transient upstream error {code}")
+        self.code = code
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -96,23 +122,44 @@ def _file_anthropic_token() -> str | None:
 def _anthropic_direct(label: str) -> dict[str, Any] | None:
     """Query the Anthropic OAuth usage API with the gateway's file token, used as
     a fallback when account_usage can't (stale login-Keychain session). Mirrors
-    account_usage's anthropic window mapping."""
+    account_usage's anthropic window mapping.
+
+    A transient HTTP 429 (rate limit) is NOT an auth failure: the token is valid,
+    the API is just busy. Retry a couple of times with a short backoff, and raise
+    on a persistent 429 so the caller can keep the last-good reading instead of
+    collapsing Claude to "authentication_required" (which reads as signed-out)."""
     token = _file_anthropic_token()
     if not token or not token.startswith("sk-ant-oat"):
         return None
-    try:
-        req = urllib.request.Request(
-            "https://api.anthropic.com/api/oauth/usage",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json",
-                "anthropic-beta": "oauth-2025-04-20",
-                "User-Agent": "claude-code/2.1.0",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            payload = json.load(resp) or {}
-    except Exception:
+    payload = None
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                "https://api.anthropic.com/api/oauth/usage",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json",
+                    "anthropic-beta": "oauth-2025-04-20",
+                    "User-Agent": "claude-code/2.1.0",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                payload = json.load(resp) or {}
+            break
+        except urllib.error.HTTPError as exc:
+            # 429 / 5xx are transient: back off and retry, then signal the caller.
+            if exc.code == 429 or 500 <= exc.code < 600:
+                if attempt < 2:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise _TransientQuotaError(exc.code)
+            return None
+        except Exception:
+            if attempt < 2:
+                time.sleep(1.0)
+                continue
+            return None
+    if payload is None:
         return None
     windows = []
     for key, wlabel in (
@@ -162,15 +209,63 @@ def _provider(provider: str, label: str) -> dict[str, Any]:
     # authentication_required even though the `claude login` file token works —
     # fall back to querying usage with that file token so it still shows.
     if provider == "anthropic" and result.get("status") != "ok":
-        fallback = _anthropic_direct(label)
+        try:
+            fallback = _anthropic_direct(label)
+        except _TransientQuotaError:
+            # Rate-limited / upstream busy — NOT signed out. Keep the last-good
+            # reading if we have a recent one; otherwise report it as a temporary
+            # blip rather than "sign in".
+            fallback = None
+            cached = _fresh_last_good(provider)
+            if cached is not None:
+                return cached
+            result = {
+                "provider": provider,
+                "label": label,
+                "status": "unavailable",
+                "source": None,
+                "plan": None,
+                "fetched_at": None,
+                "windows": [],
+                "details": [],
+                "message": f"{label} usage is rate limited — try again shortly.",
+            }
         if fallback is not None:
-            return fallback
+            result = fallback
+    # A good reading refreshes the last-good cache; a bad one is masked by a recent
+    # last-good so a transient failure never blanks a provider that has quota.
+    if result.get("status") == "ok" and result.get("windows"):
+        _record_last_good(provider, result)
+        return result
+    cached = _fresh_last_good(provider)
+    if cached is not None:
+        return cached
     return result
+
+
+def _record_last_good(provider: str, snapshot: dict[str, Any]) -> None:
+    _last_good[provider] = snapshot
+    _last_good_at[provider] = time.monotonic()
+
+
+def _fresh_last_good(provider: str) -> dict[str, Any] | None:
+    at = _last_good_at.get(provider, 0.0)
+    if at and time.monotonic() - at < _LAST_GOOD_TTL:
+        return _last_good.get(provider)
+    return None
 
 
 def _provider_via_account_usage(provider: str, label: str) -> dict[str, Any]:
     snapshot = fetch_account_usage(provider)
     if snapshot is None:
+        # core's fetch_account_usage() swallows EVERY error to None — a real
+        # signed-out AND a transient 429/5xx/network blip look identical here.
+        # Rather than always saying "sign in" (which blanks a provider that has
+        # quota during a blip), prefer a recent last-good reading; only when we
+        # have never seen this provider succeed do we surface the sign-in prompt.
+        cached = _fresh_last_good(provider)
+        if cached is not None:
+            return cached
         return {
             "provider": provider,
             "label": label,
@@ -254,7 +349,17 @@ def _load(refresh: bool) -> dict[str, Any]:
     global _cache, _cache_at
     now = time.monotonic()
     with _lock:
+        # Serve the cache for a normal (non-refresh) read within the cache window.
         if not refresh and _cache is not None and now - _cache_at < CACHE_SECONDS:
+            return _cache
+        # A forced refresh (?refresh=true) still honours a MINIMUM interval: the
+        # menu-bar reader requests refresh on every poll, and each miss makes a live
+        # upstream usage call per provider. Anthropic's usage API rate-limits that
+        # quickly (HTTP 429 → account_usage returns None → provider reads as
+        # "sign in"), so refreshing faster than the upstream tolerates is what
+        # BLANKS the quota. Below the floor a forced refresh returns the last cache
+        # instead of hammering upstream.
+        if _cache is not None and now - _cache_at < _MIN_REFRESH_SECONDS:
             return _cache
         configured = _configured_providers()
         providers = [_provider(slug, label) for slug, label in configured]
