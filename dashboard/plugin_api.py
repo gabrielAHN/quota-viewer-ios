@@ -75,7 +75,18 @@ _lock = Lock()
 # stale reading eventually gives way to the real error.
 _last_good: dict[str, dict[str, Any]] = {}
 _last_good_at: dict[str, float] = {}
-_LAST_GOOD_TTL = 15 * 60  # seconds
+# How long a last-good reading is trusted after a failure. The gateway process can
+# get into a state where a provider's live usage read fails for a while (an
+# in-process credential/rate-limit condition that a fresh process doesn't hit),
+# so keep the last good reading long enough to ride that out instead of blanking
+# the menu back to "sign in".
+_LAST_GOOD_TTL = 6 * 60 * 60  # seconds
+# Last-good is also mirrored to disk so it survives a gateway restart AND lets a
+# fresh short-lived reader (which succeeds) hand a good reading to the long-lived
+# dashboard process that is currently failing in-process.
+_LAST_GOOD_PATH = os.path.join(
+    os.environ.get("TMPDIR", "/tmp").rstrip("/"), "provider-quota-lastgood.json"
+)
 
 
 class _TransientQuotaError(Exception):
@@ -246,12 +257,40 @@ def _provider(provider: str, label: str) -> dict[str, Any]:
 def _record_last_good(provider: str, snapshot: dict[str, Any]) -> None:
     _last_good[provider] = snapshot
     _last_good_at[provider] = time.monotonic()
+    # Mirror to disk (wall-clock stamped) so it survives a restart and can be
+    # shared with other reader processes.
+    try:
+        disk = _read_last_good_file()
+        disk[provider] = {"at": time.time(), "snapshot": snapshot}
+        tmp = _LAST_GOOD_PATH + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(disk, fh)
+        os.replace(tmp, _LAST_GOOD_PATH)
+    except Exception:
+        pass
+
+
+def _read_last_good_file() -> dict[str, Any]:
+    try:
+        with open(_LAST_GOOD_PATH) as fh:
+            data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 def _fresh_last_good(provider: str) -> dict[str, Any] | None:
+    # Prefer the in-process reading; fall back to the on-disk mirror (which another
+    # reader process may have refreshed more recently than this one).
     at = _last_good_at.get(provider, 0.0)
     if at and time.monotonic() - at < _LAST_GOOD_TTL:
         return _last_good.get(provider)
+    entry = _read_last_good_file().get(provider)
+    if isinstance(entry, dict):
+        stamped = entry.get("at", 0)
+        snapshot = entry.get("snapshot")
+        if isinstance(stamped, (int, float)) and time.time() - stamped < _LAST_GOOD_TTL and isinstance(snapshot, dict):
+            return snapshot
     return None
 
 

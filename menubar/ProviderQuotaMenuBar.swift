@@ -141,6 +141,12 @@ final class HoverGlowButton: NSButton {
             updateGlow()
         }
     }
+    // When set, the button's fill/border/glow is a full circle (cornerRadius =
+    // half the height) instead of a rounded rectangle — used for the round GitHub
+    // mark so its chip matches the icon.
+    var circular = false {
+        didSet { if circular != oldValue { needsLayout = true } }
+    }
     private var hoverArea: NSTrackingArea?
     private var hovering = false
 
@@ -174,7 +180,9 @@ final class HoverGlowButton: NSButton {
 
     override func layout() {
         super.layout()
-        layer?.shadowPath = CGPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), cornerWidth: 7, cornerHeight: 7, transform: nil)
+        let radius = circular ? min(bounds.width, bounds.height) / 2 : 7
+        layer?.cornerRadius = radius
+        layer?.shadowPath = CGPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), cornerWidth: radius, cornerHeight: radius, transform: nil)
     }
 
     override func mouseEntered(with event: NSEvent) {
@@ -1447,6 +1455,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let repo = iconActionButton(githubIcon(size: 15),
                                     label: "Open the project on GitHub",
                                     action: #selector(openRepo), glowColor: .hermesBlue)
+        repo.circular = true   // round chip to match the round GitHub mark
         repo.frame = NSRect(x: 294, y: showConnection ? 31 : 19, width: 18, height: 18)
         view.addSubview(repo)
         return view
@@ -2621,85 +2630,186 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    // The actual GitHub mark (SF Symbols has none), rendered from the octicons
-    // "mark-github" glyph path (16×16 viewBox, cubic-only) — the octocat as the
-    // FILLED shape. Template image so it tints like the other action icons.
-    private static let githubMarkPath =
-        "M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"
+    // Official GitHub circular mark (Invertocat) PNG, base64 — kept as data so the
+    // single-file swiftc build stays self-contained (no bundle Resources needed).
+    // Source: menubar/assets/github-mark.png (GitHub-Mark logo, white→transparent
+    // as a tintable template). SF Symbols has no GitHub logo.
+    private static let githubMarkBase64 =
+        "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"
 
     private func githubIcon(size: CGFloat) -> NSImage {
+        // Decode once, cached; render into a fixed-size template so it tints like
+        // the other action icons and stays crisp at the menu's small size.
+        if let cached = Self.cachedGithubIcon, cached.size.width == size { return cached }
+        guard let data = Data(base64Encoded: Self.githubMarkBase64),
+              let src = NSImage(data: data) else {
+            return NSImage(size: NSSize(width: size, height: size))
+        }
         let image = NSImage(size: NSSize(width: size, height: size))
         image.lockFocus()
-        let path = Self.parseSVGPath(Self.githubMarkPath)
-        // The SVG y-axis points DOWN; NSBezierPath's up. Flip and scale 16→size.
-        let t = NSAffineTransform()
-        t.scaleX(by: size / 16.0, yBy: -size / 16.0)
-        t.translateX(by: 0, yBy: -16.0)
-        path.transform(using: t as AffineTransform)
-        NSColor.black.setFill()   // template: real colour comes from contentTintColor
-        path.fill()
+        src.draw(in: NSRect(x: 0, y: 0, width: size, height: size),
+                 from: .zero, operation: .sourceOver, fraction: 1.0)
         image.unlockFocus()
-        image.isTemplate = true
+        image.isTemplate = true   // black-on-transparent → follows contentTintColor
+        Self.cachedGithubIcon = image
         return image
     }
-
-    // Minimal SVG path parser for M/m L/l C/c Z/z (the github mark uses only these).
-    private static func parseSVGPath(_ d: String) -> NSBezierPath {
-        func numbers(_ s: Substring) -> [CGFloat] {
-            var out: [CGFloat] = []; var cur = ""
-            func flush() { if !cur.isEmpty, let v = Double(cur) { out.append(CGFloat(v)) }; cur = "" }
-            for ch in s {
-                if ch == "-" {
-                    if !cur.isEmpty, cur.last != "e", cur.last != "E" { flush() }
-                    cur.append(ch)
-                } else if ch == "." {
-                    if cur.contains(".") { flush() }
-                    cur.append(ch)
-                } else if ch == " " || ch == "," { flush() } else { cur.append(ch) }
-            }
-            flush(); return out
-        }
-        let path = NSBezierPath()
-        let cmds = Set("MmLlCcZz")
-        var i = d.startIndex
-        var cp = CGPoint.zero, start = CGPoint.zero
-        while i < d.endIndex {
-            while i < d.endIndex, !cmds.contains(d[i]) { i = d.index(after: i) }
-            guard i < d.endIndex else { break }
-            let cmd = d[i]
-            let argsStart = d.index(after: i)
-            var j = argsStart
-            while j < d.endIndex, !cmds.contains(d[j]) { j = d.index(after: j) }
-            let n = numbers(d[argsStart..<j]); i = j
-            switch cmd {
-            case "M", "m":
-                let rel = cmd == "m"; var k = 0
-                while k + 1 < n.count {
-                    var p = CGPoint(x: n[k], y: n[k+1]); if rel { p.x += cp.x; p.y += cp.y }
-                    if k == 0 { path.move(to: p); start = p } else { path.line(to: p) }
-                    cp = p; k += 2
-                }
-            case "L", "l":
-                let rel = cmd == "l"; var k = 0
-                while k + 1 < n.count {
-                    var p = CGPoint(x: n[k], y: n[k+1]); if rel { p.x += cp.x; p.y += cp.y }
-                    path.line(to: p); cp = p; k += 2
-                }
-            case "C", "c":
-                let rel = cmd == "c"; var k = 0
-                while k + 5 < n.count {
-                    var c1 = CGPoint(x: n[k], y: n[k+1]), c2 = CGPoint(x: n[k+2], y: n[k+3]), e = CGPoint(x: n[k+4], y: n[k+5])
-                    if rel { c1.x += cp.x; c1.y += cp.y; c2.x += cp.x; c2.y += cp.y; e.x += cp.x; e.y += cp.y }
-                    path.curve(to: e, controlPoint1: c1, controlPoint2: c2)
-                    cp = e; k += 6
-                }
-            case "Z", "z":
-                path.close(); cp = start
-            default: break
-            }
-        }
-        return path
-    }
+    private static var cachedGithubIcon: NSImage?
 
     // Where this app was installed from (a git checkout of the repo), recorded by
     // install-menubar.sh so "Check for Updates" knows what to pull + rebuild.
