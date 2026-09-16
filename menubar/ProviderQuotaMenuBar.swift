@@ -2570,12 +2570,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func actionBarView() -> NSView {
         let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 42))
         // Refresh is per-provider now (a refresh icon on each provider row), so the
-        // bottom bar has an app-theme toggle, Check-for-Updates and Close.
+        // bottom bar has an app-theme toggle, a link to the repo, Check-for-Updates
+        // and Close.
         let theme = iconActionButton(NSImage(systemSymbolName: appearanceSymbolName(), accessibilityDescription: nil),
                                      label: appearanceTooltip(),
                                      action: #selector(cycleAppearance), glowColor: .hermesBlue)
-        theme.frame = NSRect(x: 250, y: 7, width: 28, height: 28)
+        theme.frame = NSRect(x: 218, y: 7, width: 28, height: 28)
         view.addSubview(theme)
+
+        let repo = iconActionButton(NSImage(systemSymbolName: "chevron.left.forwardslash.chevron.right", accessibilityDescription: nil),
+                                    label: "Open the project on GitHub",
+                                    action: #selector(openRepo), glowColor: .hermesBlue)
+        repo.frame = NSRect(x: 250, y: 7, width: 28, height: 28)
+        view.addSubview(repo)
 
         let update = iconActionButton(NSImage(systemSymbolName: "arrow.triangle.2.circlepath", accessibilityDescription: nil),
                                       label: "Check for Updates (pull latest from the repo)",
@@ -2587,6 +2594,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         close.frame = NSRect(x: 314, y: 7, width: 28, height: 28)
         view.addSubview(close)
         return view
+    }
+
+    // The project's GitHub page.
+    static let repoURL = "https://github.com/gabrielAHN/quota-viewer-ios"
+
+    @objc private func openRepo() {
+        menu.cancelTracking()
+        if let url = URL(string: Self.repoURL) {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     // Where this app was installed from (a git checkout of the repo), recorded by
@@ -2644,6 +2661,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func checkForUpdates() {
+        // The button lives in a custom view inside the status menu, which stays OPEN
+        // when it's clicked — and an NSAlert can't present while the menu is still
+        // tracking (so the click looked like it did nothing). Close the menu first;
+        // the fetch runs in the background and the alerts present cleanly after.
+        menu.cancelTracking()
         guard let repo = sourceRepoPath() else {
             // Homebrew install → `brew upgrade` (then restart the service).
             if homebrewInstalled(), let brew = brewExecutable() {
