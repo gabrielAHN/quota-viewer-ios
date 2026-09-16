@@ -2110,8 +2110,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // and its reset match.
         if let session = sessionWindow(provider), let pct = session.remainingPercent {
             let base = pct <= 0 ? "No session quota" : "\(Int(pct.rounded()))% left"
-            if let resetsAt = session.resetsAt, let reset = relativeReset(resetsAt) {
-                return "\(base) · resets \(reset)"
+            if let precise = preciseCountdown(session.resetsAt) {
+                return "\(base) · resets in \(precise)"
             }
             return base
         }
@@ -2889,9 +2889,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func formattedReset(_ value: String?) -> String? {
         guard let date = parsedDate(value) else { return nil }
-        let relative = RelativeDateTimeFormatter()
-        relative.unitsStyle = .short
-        let relativeText = relative.localizedString(for: date, relativeTo: Date())
+        // Prefer a precise "4h 51m" countdown over RelativeDateTimeFormatter's coarse
+        // "in 4 hr." (which rounds a 4h51m window down to "4 hr" — reading as almost
+        // reset when it isn't). Fall back to the relative phrase once it's past.
+        let relativeText = preciseCountdown(value).map { "in \($0)" }
+            ?? {
+                let relative = RelativeDateTimeFormatter()
+                relative.unitsStyle = .short
+                return relative.localizedString(for: date, relativeTo: Date())
+            }()
         return "\(relativeText) · \(date.formatted(date: .abbreviated, time: .shortened))"
     }
 
