@@ -1239,6 +1239,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private static let quotaRecoveryCelebration: TimeInterval = 8
     // Whether the Sources selector is expanded to show its per-source checkboxes.
     private var sourcesExpanded = false
+    // Whether a newer version is available on the repo. nil = not checked yet /
+    // unknown; false = up to date (Update button disabled); true = behind. Drives
+    // the action-bar Update button's icon + enabled state. Refreshed in the
+    // background when the menu opens.
+    private var updateAvailable: Bool?
+    private var checkingUpdate = false
     // Last provider slug→label from a successful fetch, PER source, so a
     // disconnected (or freshly-switched) source lists only its own providers, and
     // disabling a source can drop its providers entirely.
@@ -1346,6 +1352,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         applyMenuWindowAppearance()   // theme the dropdown to match the forced mode
         refreshDesktopStatus()
         syncPetsFromGateway()  // reflect a pet installed since the last open
+        checkUpdateStatus()    // refresh the Update button's available/up-to-date state
     }
 
     func menuDidClose(_ menu: NSMenu) {
@@ -1435,6 +1442,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         image.image = NSImage(systemSymbolName: "gauge.with.dots.needle.50percent", accessibilityDescription: "Quotas")
         image.contentTintColor = .hermesBlue
         view.addSubview(image)
+        // Small GitHub link (the real GitHub mark) tucked in the top-right, sized to
+        // match the gauge icon, just left of it.
+        let repo = iconActionButton(githubIcon(size: 15),
+                                    label: "Open the project on GitHub",
+                                    action: #selector(openRepo), glowColor: .hermesBlue)
+        repo.frame = NSRect(x: 294, y: showConnection ? 31 : 19, width: 18, height: 18)
+        view.addSubview(repo)
         return view
     }
 
@@ -2569,25 +2583,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func actionBarView() -> NSView {
         let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 42))
-        // Refresh is per-provider now (a refresh icon on each provider row), so the
-        // bottom bar has an app-theme toggle, a link to the repo, Check-for-Updates
-        // and Close.
+        // Right cluster: app-theme toggle, Check-for-Updates and Close. (The GitHub
+        // link is a small icon in the title header, next to the "Updated" time.)
         let theme = iconActionButton(NSImage(systemSymbolName: appearanceSymbolName(), accessibilityDescription: nil),
                                      label: appearanceTooltip(),
                                      action: #selector(cycleAppearance), glowColor: .hermesBlue)
-        theme.frame = NSRect(x: 218, y: 7, width: 28, height: 28)
+        theme.frame = NSRect(x: 250, y: 7, width: 28, height: 28)
         view.addSubview(theme)
 
-        let repo = iconActionButton(NSImage(systemSymbolName: "chevron.left.forwardslash.chevron.right", accessibilityDescription: nil),
-                                    label: "Open the project on GitHub",
-                                    action: #selector(openRepo), glowColor: .hermesBlue)
-        repo.frame = NSRect(x: 250, y: 7, width: 28, height: 28)
-        view.addSubview(repo)
-
-        let update = iconActionButton(NSImage(systemSymbolName: "arrow.triangle.2.circlepath", accessibilityDescription: nil),
-                                      label: "Check for Updates (pull latest from the repo)",
-                                      action: #selector(checkForUpdates), glowColor: .hermesBlue)
+        // When already on the latest, the Update button is DISABLED and shows a
+        // "checkmark" (clearly "up to date") instead of the ambiguous refresh arrows;
+        // when an update is available it shows a download arrow and is enabled.
+        let upToDate = (updateAvailable == false)
+        let updateSymbol = upToDate ? "checkmark.circle" : (updateAvailable == true ? "arrow.down.circle" : "arrow.triangle.2.circlepath")
+        let update = iconActionButton(NSImage(systemSymbolName: updateSymbol, accessibilityDescription: nil),
+                                      label: upToDate ? "Up to date" : "Check for Updates (pull latest from the repo)",
+                                      action: #selector(checkForUpdates),
+                                      glowColor: updateAvailable == true ? .hermesGreen : .hermesBlue)
         update.frame = NSRect(x: 282, y: 7, width: 28, height: 28)
+        update.isEnabled = !upToDate
+        update.alphaValue = upToDate ? 0.4 : 1.0
         view.addSubview(update)
 
         let close = iconActionButton(NSImage(systemSymbolName: "xmark", accessibilityDescription: nil), label: "Close Provider Quotas", action: #selector(quit), glowColor: .hermesRed)
@@ -2604,6 +2619,86 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let url = URL(string: Self.repoURL) {
             NSWorkspace.shared.open(url)
         }
+    }
+
+    // The actual GitHub mark (SF Symbols has none), rendered from the octicons
+    // "mark-github" glyph path (16×16 viewBox, cubic-only) — the octocat as the
+    // FILLED shape. Template image so it tints like the other action icons.
+    private static let githubMarkPath =
+        "M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"
+
+    private func githubIcon(size: CGFloat) -> NSImage {
+        let image = NSImage(size: NSSize(width: size, height: size))
+        image.lockFocus()
+        let path = Self.parseSVGPath(Self.githubMarkPath)
+        // The SVG y-axis points DOWN; NSBezierPath's up. Flip and scale 16→size.
+        let t = NSAffineTransform()
+        t.scaleX(by: size / 16.0, yBy: -size / 16.0)
+        t.translateX(by: 0, yBy: -16.0)
+        path.transform(using: t as AffineTransform)
+        NSColor.black.setFill()   // template: real colour comes from contentTintColor
+        path.fill()
+        image.unlockFocus()
+        image.isTemplate = true
+        return image
+    }
+
+    // Minimal SVG path parser for M/m L/l C/c Z/z (the github mark uses only these).
+    private static func parseSVGPath(_ d: String) -> NSBezierPath {
+        func numbers(_ s: Substring) -> [CGFloat] {
+            var out: [CGFloat] = []; var cur = ""
+            func flush() { if !cur.isEmpty, let v = Double(cur) { out.append(CGFloat(v)) }; cur = "" }
+            for ch in s {
+                if ch == "-" {
+                    if !cur.isEmpty, cur.last != "e", cur.last != "E" { flush() }
+                    cur.append(ch)
+                } else if ch == "." {
+                    if cur.contains(".") { flush() }
+                    cur.append(ch)
+                } else if ch == " " || ch == "," { flush() } else { cur.append(ch) }
+            }
+            flush(); return out
+        }
+        let path = NSBezierPath()
+        let cmds = Set("MmLlCcZz")
+        var i = d.startIndex
+        var cp = CGPoint.zero, start = CGPoint.zero
+        while i < d.endIndex {
+            while i < d.endIndex, !cmds.contains(d[i]) { i = d.index(after: i) }
+            guard i < d.endIndex else { break }
+            let cmd = d[i]
+            let argsStart = d.index(after: i)
+            var j = argsStart
+            while j < d.endIndex, !cmds.contains(d[j]) { j = d.index(after: j) }
+            let n = numbers(d[argsStart..<j]); i = j
+            switch cmd {
+            case "M", "m":
+                let rel = cmd == "m"; var k = 0
+                while k + 1 < n.count {
+                    var p = CGPoint(x: n[k], y: n[k+1]); if rel { p.x += cp.x; p.y += cp.y }
+                    if k == 0 { path.move(to: p); start = p } else { path.line(to: p) }
+                    cp = p; k += 2
+                }
+            case "L", "l":
+                let rel = cmd == "l"; var k = 0
+                while k + 1 < n.count {
+                    var p = CGPoint(x: n[k], y: n[k+1]); if rel { p.x += cp.x; p.y += cp.y }
+                    path.line(to: p); cp = p; k += 2
+                }
+            case "C", "c":
+                let rel = cmd == "c"; var k = 0
+                while k + 5 < n.count {
+                    var c1 = CGPoint(x: n[k], y: n[k+1]), c2 = CGPoint(x: n[k+2], y: n[k+3]), e = CGPoint(x: n[k+4], y: n[k+5])
+                    if rel { c1.x += cp.x; c1.y += cp.y; c2.x += cp.x; c2.y += cp.y; e.x += cp.x; e.y += cp.y }
+                    path.curve(to: e, controlPoint1: c1, controlPoint2: c2)
+                    cp = e; k += 6
+                }
+            case "Z", "z":
+                path.close(); cp = start
+            default: break
+            }
+        }
+        return path
     }
 
     // Where this app was installed from (a git checkout of the repo), recorded by
@@ -2660,6 +2755,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"].first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
+    // Quiet background check run on menu open: works out whether the repo has
+    // newer commits and updates `updateAvailable` so the action-bar Update button
+    // can disable + change its icon when already on the latest. No alerts — that's
+    // the explicit checkForUpdates() path. Homebrew installs (no git checkout) skip
+    // the check and leave the button enabled.
+    private func checkUpdateStatus() {
+        guard !checkingUpdate, let repo = sourceRepoPath() else { return }
+        checkingUpdate = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let git = Self.git()
+            _ = Self.run(git, ["-C", repo, "fetch", "--quiet", "origin"])
+            let behind = Self.commitsBehind(repo)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.checkingUpdate = false
+                if let behind {
+                    self.updateAvailable = behind > 0
+                    self.rebuildMenu()
+                }
+            }
+        }
+    }
+
+    // Commits the local checkout is behind its update target (nil if it can't be
+    // determined — a detached/diverged checkout or a missing target).
+    private static func commitsBehind(_ repo: String) -> Int? {
+        let git = git()
+        guard let target = updateTarget(repo) else { return nil }
+        if run(git, ["-C", repo, "merge-base", "--is-ancestor", "HEAD", target]).code == 0 {
+            let revisionList = run(git, ["-C", repo, "rev-list", "--count", "HEAD..\(target)"])
+            guard revisionList.code == 0,
+                  let count = Int(revisionList.out.trimmingCharacters(in: .whitespacesAndNewlines)) else { return nil }
+            return count
+        }
+        if run(git, ["-C", repo, "merge-base", "--is-ancestor", target, "HEAD"]).code == 0 {
+            return 0   // ahead of / at the target → up to date
+        }
+        return nil     // diverged
+    }
+
     @objc private func checkForUpdates() {
         // The button lives in a custom view inside the status menu, which stays OPEN
         // when it's clicked — and an NSAlert can't present while the menu is still
@@ -2694,23 +2829,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 DispatchQueue.main.async { Self.notify("Update check failed", "The repository default branch could not be found.") }
                 return
             }
-            let ancestry = Self.run(git, ["-C", repo, "merge-base", "--is-ancestor", "HEAD", target])
-            let behind: Int
-            if ancestry.code == 0 {
-                let revisionList = Self.run(git, ["-C", repo, "rev-list", "--count", "HEAD..\(target)"])
-                guard revisionList.code == 0,
-                      let count = Int(revisionList.out.trimmingCharacters(in: .whitespacesAndNewlines)) else {
-                    DispatchQueue.main.async { Self.notify("Update check failed", revisionList.out.isEmpty ? "Could not compare repository versions." : revisionList.out) }
-                    return
-                }
-                behind = count
-            } else if Self.run(git, ["-C", repo, "merge-base", "--is-ancestor", target, "HEAD"]).code == 0 {
-                behind = 0
-            } else {
+            guard let behind = Self.commitsBehind(repo) else {
                 DispatchQueue.main.async { Self.notify("Update unavailable", "The local checkout has changes that are not on \(target). Merge or switch branches before updating.") }
                 return
             }
             DispatchQueue.main.async {
+                self.updateAvailable = behind > 0
                 if behind == 0 {
                     Self.notify("Up to date", "You're on the latest version.")
                     return
