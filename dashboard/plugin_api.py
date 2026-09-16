@@ -59,6 +59,12 @@ def _configured_providers() -> tuple[tuple[str, str], ...]:
 
 
 CACHE_SECONDS = 60
+# The shortest interval a forced ?refresh=true is allowed to actually hit upstream.
+# The menu-bar reader asks for a refresh on every poll (a few seconds apart); each
+# real refresh makes a live usage call per provider, and Anthropic's usage endpoint
+# 429s under that cadence — which core turns into None → "sign in", blanking a
+# provider that actually has quota. Keep forced refreshes from out-pacing upstream.
+_MIN_REFRESH_SECONDS = 30
 _cache: dict[str, Any] | None = None
 _cache_at = 0.0
 _lock = Lock()
@@ -252,6 +258,14 @@ def _fresh_last_good(provider: str) -> dict[str, Any] | None:
 def _provider_via_account_usage(provider: str, label: str) -> dict[str, Any]:
     snapshot = fetch_account_usage(provider)
     if snapshot is None:
+        # core's fetch_account_usage() swallows EVERY error to None — a real
+        # signed-out AND a transient 429/5xx/network blip look identical here.
+        # Rather than always saying "sign in" (which blanks a provider that has
+        # quota during a blip), prefer a recent last-good reading; only when we
+        # have never seen this provider succeed do we surface the sign-in prompt.
+        cached = _fresh_last_good(provider)
+        if cached is not None:
+            return cached
         return {
             "provider": provider,
             "label": label,
@@ -335,7 +349,17 @@ def _load(refresh: bool) -> dict[str, Any]:
     global _cache, _cache_at
     now = time.monotonic()
     with _lock:
+        # Serve the cache for a normal (non-refresh) read within the cache window.
         if not refresh and _cache is not None and now - _cache_at < CACHE_SECONDS:
+            return _cache
+        # A forced refresh (?refresh=true) still honours a MINIMUM interval: the
+        # menu-bar reader requests refresh on every poll, and each miss makes a live
+        # upstream usage call per provider. Anthropic's usage API rate-limits that
+        # quickly (HTTP 429 → account_usage returns None → provider reads as
+        # "sign in"), so refreshing faster than the upstream tolerates is what
+        # BLANKS the quota. Below the floor a forced refresh returns the last cache
+        # instead of hammering upstream.
+        if _cache is not None and now - _cache_at < _MIN_REFRESH_SECONDS:
             return _cache
         configured = _configured_providers()
         providers = [_provider(slug, label) for slug, label in configured]
