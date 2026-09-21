@@ -75,6 +75,12 @@ _lock = Lock()
 # stale reading eventually gives way to the real error.
 _last_good: dict[str, dict[str, Any]] = {}
 _last_good_at: dict[str, float] = {}
+# Wall-clock stamp for each in-process reading, kept ALONGSIDE the monotonic
+# _last_good_at so an in-process reading can be age-compared against the on-disk
+# mirror (which is wall-clock stamped by whatever process wrote it). Monotonic
+# clocks are per-process and can't be compared across the refresher and the
+# dashboard, so the cross-source "which is newer" decision uses wall time.
+_last_good_wall: dict[str, float] = {}
 # How long a last-good reading is trusted after a failure. The gateway process can
 # get into a state where a provider's live usage read fails for a while (an
 # in-process credential/rate-limit condition that a fresh process doesn't hit),
@@ -257,6 +263,7 @@ def _provider(provider: str, label: str) -> dict[str, Any]:
 def _record_last_good(provider: str, snapshot: dict[str, Any]) -> None:
     _last_good[provider] = snapshot
     _last_good_at[provider] = time.monotonic()
+    _last_good_wall[provider] = time.time()
     # Mirror to disk (wall-clock stamped) so it survives a restart and can be
     # shared with other reader processes.
     try:
@@ -280,18 +287,34 @@ def _read_last_good_file() -> dict[str, Any]:
 
 
 def _fresh_last_good(provider: str) -> dict[str, Any] | None:
-    # Prefer the in-process reading; fall back to the on-disk mirror (which another
-    # reader process may have refreshed more recently than this one).
-    at = _last_good_at.get(provider, 0.0)
-    if at and time.monotonic() - at < _LAST_GOOD_TTL:
-        return _last_good.get(provider)
+    # Two sources of a last-good reading, both wall-clock stamped so they can be
+    # compared across processes: this process's own in-process reading, and the
+    # on-disk mirror the refresher (or another reader) keeps current. Return the
+    # NEWER of the two within TTL — critically, NOT "in-process first". A
+    # long-lived dashboard whose live reads have rotted keeps a stale in-process
+    # reading indefinitely; preferring it would ignore the fresh disk reading the
+    # refresher writes precisely to hand this wedged process a current value. So
+    # whichever was recorded more recently by wall clock wins.
+    now = time.time()
+    in_proc = _last_good.get(provider)
+    in_proc_wall = _last_good_wall.get(provider, 0.0)
+    in_proc_fresh = bool(in_proc) and (now - in_proc_wall) < _LAST_GOOD_TTL
+
+    disk_snapshot = None
+    disk_wall = 0.0
     entry = _read_last_good_file().get(provider)
     if isinstance(entry, dict):
         stamped = entry.get("at", 0)
         snapshot = entry.get("snapshot")
-        if isinstance(stamped, (int, float)) and time.time() - stamped < _LAST_GOOD_TTL and isinstance(snapshot, dict):
-            return snapshot
-    return None
+        if isinstance(stamped, (int, float)) and (now - stamped) < _LAST_GOOD_TTL and isinstance(snapshot, dict):
+            disk_snapshot = snapshot
+            disk_wall = float(stamped)
+
+    if in_proc_fresh and (disk_snapshot is None or in_proc_wall >= disk_wall):
+        return in_proc
+    if disk_snapshot is not None:
+        return disk_snapshot
+    return in_proc if in_proc_fresh else None
 
 
 def _provider_via_account_usage(provider: str, label: str) -> dict[str, Any]:
