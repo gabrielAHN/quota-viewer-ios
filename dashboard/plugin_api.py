@@ -121,11 +121,23 @@ def _file_anthropic_token() -> str | None:
     Reading the file directly sidesteps that, and stays linked to the gateway's
     own subscription."""
     try:
-        from agent.anthropic_adapter import (
-            _read_claude_code_credentials_from_file,
-            _refresh_oauth_token,
-            is_claude_code_token_valid,
-        )
+        # These live in agent.anthropic_credentials on current Hermes; older cores
+        # exported them from agent.anthropic_adapter. Try the current path first,
+        # then fall back, so this fallback keeps working across core versions
+        # instead of silently ImportError-ing (which collapsed Claude to "sign in"
+        # whenever the primary account_usage path had a blip).
+        try:
+            from agent.anthropic_credentials import (
+                _read_claude_code_credentials_from_file,
+                _refresh_oauth_token,
+                is_claude_code_token_valid,
+            )
+        except ImportError:
+            from agent.anthropic_adapter import (
+                _read_claude_code_credentials_from_file,
+                _refresh_oauth_token,
+                is_claude_code_token_valid,
+            )
         creds = _read_claude_code_credentials_from_file()
         if not creds:
             return None
