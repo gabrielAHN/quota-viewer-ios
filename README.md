@@ -63,6 +63,25 @@ The plugin reports a configurable set via `PROVIDER_QUOTA_PROVIDERS`
 `openrouter,anthropic,openai-codex`. Every quota is read through the gateway's own
 credentials, so the plugin stays tied to the gateway it runs in.
 
+## Self-healing quota (last-good refresher)
+
+A provider's live usage read can fail *in-process* for a while inside the
+long-lived gateway dashboard — an expired-token refresh gap, or a rate-limit
+(HTTP 429) condition — even though the credentials are fine and a fresh process
+reads the quota without a hitch. When that happens the dashboard would otherwise
+blank the provider back to "sign in" despite it having quota.
+
+The plugin keeps a disk-backed **last-good** snapshot
+(`$TMPDIR/provider-quota-lastgood.json`) to ride out those blips, and `install.sh`
+registers a small launchd job (`io.github.gabrielahn.provider-quota-refresh`,
+every 120s) that re-reads every provider in a **fresh** process and writes that
+cache. A fresh process never inherits the wedged credential state, so it hands
+the failing dashboard a current reading and the menu self-heals **without a
+dashboard restart**. The dashboard prefers whichever last-good reading (its own
+in-process one or the refresher's on-disk one) is newer by wall clock, so a
+rotted process can't keep serving a stale value. It's the gateway host that runs
+this job; `verify.sh` confirms it's registered.
+
 ## Requirements
 
 macOS 13+ · Homebrew **or** the Xcode command-line tools (`xcode-select
