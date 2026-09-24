@@ -146,6 +146,7 @@ try:
             fail("Sign in to Hermes Desktop (%s)." % url)
 
         value = entry.get("value") or ""
+        _ss_key = None
         if entry.get("encoding") == "safeStorage":
             # Electron safeStorage v10: AES-128-CBC, key = PBKDF2-HMAC-SHA1(secret,
             # "saltysalt", 1003, 16), IV = 16 spaces. Decrypt with openssl to avoid a
@@ -157,12 +158,12 @@ try:
                 ).decode().strip()
             except Exception as exc:
                 fail("Cannot read 'Hermes Safe Storage' Keychain key: %s" % exc)
-            key = hashlib.pbkdf2_hmac("sha1", secret.encode(), b"saltysalt", 1003, dklen=16)
+            _ss_key = hashlib.pbkdf2_hmac("sha1", secret.encode(), b"saltysalt", 1003, dklen=16)
             raw = base64.b64decode(value)
             if raw[:3] != b"v10":
                 fail("Unexpected Hermes Desktop token format.")
             proc = subprocess.run(
-                ["openssl", "enc", "-d", "-aes-128-cbc", "-K", key.hex(),
+                ["openssl", "enc", "-d", "-aes-128-cbc", "-K", _ss_key.hex(),
                  "-iv", "20" * 16, "-nopad"],
                 input=raw[3:], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             )
@@ -177,6 +178,75 @@ try:
         access_token = session.get("accessToken") or ""
         if not access_token:
             fail("Sign in to Hermes Desktop.")
+
+        # --- Self-heal an expired session: the gateway's access token lives ~12h;
+        # when Hermes Desktop isn't running to rotate it, the menu-bar used to read
+        # "Disconnected" until the next manual sign-in even though the gateway was
+        # fine. If the token is (nearly) expired and a refresh token exists, rotate
+        # it through the gateway's native refresh route and persist the rotated
+        # pair back for the Desktop. Persisting is REQUIRED, not best-effort:
+        # Authelia rotates refresh tokens with reuse detection, so a rotated-but-
+        # unsaved RT would strand the on-disk one and revoke the whole session on
+        # its next use — if we cannot write the file we don't rotate at all (the
+        # gateway's single-flight replay window still dedupes a Desktop that
+        # refreshes concurrently). ---
+        def _persist_session(sess, _entry=entry, _tokens=tokens, _key=_ss_key):
+            plain = json.dumps(sess).encode()
+            if _entry.get("encoding") == "safeStorage":
+                if _key is None:
+                    return False
+                pad = 16 - len(plain) % 16
+                proc = subprocess.run(
+                    ["openssl", "enc", "-aes-128-cbc", "-K", _key.hex(),
+                     "-iv", "20" * 16, "-nopad"],
+                    input=plain + bytes([pad]) * pad,
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                )
+                if not proc.stdout:
+                    return False
+                _entry["value"] = base64.b64encode(b"v10" + proc.stdout).decode()
+            else:
+                _entry["value"] = json.dumps(sess)
+            try:
+                path = SUPPORT / "native-oauth-tokens.json"
+                tmp = path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(_tokens))
+                tmp.replace(path)
+                return True
+            except Exception:
+                return False
+
+        import time as _time
+        expires_at = session.get("expiresAt") or 0
+        refresh_token = session.get("refreshToken") or ""
+        if refresh_token and isinstance(expires_at, (int, float)) and expires_at > 0 \
+                and _time.time() >= expires_at - 120:
+            try:
+                req = urllib.request.Request(
+                    url + "/auth/native/refresh",
+                    data=json.dumps({"refresh_token": refresh_token,
+                                     "provider": session.get("provider") or ""}).encode(),
+                    headers={"Content-Type": "application/json", "Accept": "application/json",
+                             "User-Agent": _USER_AGENT},
+                )
+                with _opener.open(req, timeout=TIMEOUT) as resp:
+                    body = json.loads(resp.read())
+                new_access = body.get("access_token") or ""
+                if new_access:
+                    session["accessToken"] = new_access
+                    session["refreshToken"] = body.get("refresh_token") or refresh_token
+                    if body.get("expires_at"):
+                        session["expiresAt"] = body["expires_at"]
+                    if _persist_session(session):
+                        access_token = new_access
+                    # Persist failed: keep the OLD access token (do not adopt a
+                    # rotation we could not save) — it may still work briefly.
+            except urllib.error.HTTPError as exc:
+                if exc.code == 401:
+                    fail("Hermes Desktop session expired — open Hermes Desktop to sign in again.")
+                # 5xx / 503: gateway busy — fall through with the old token.
+            except Exception:
+                pass  # network blip: fall through with the old token
 
         def fetch(path, _url=url, _tok=access_token):
             return http_get(_url + path, {"Authorization": "Bearer " + _tok, "Accept": "*/*"})
