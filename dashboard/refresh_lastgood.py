@@ -59,12 +59,19 @@ def main() -> int:
         print(f"provider-quota refresh: cannot load plugin ({exc})", file=sys.stderr)
         return 0
     seeded = 0
+    # Since the official-quota-plugin adoption, _provider reads the quota plugin's
+    # cache rather than fetching itself — so refresh that cache first (this IS a
+    # fresh short-lived process, exactly what the sweep wants), then adapt each
+    # provider through _provider, which records the last-good disk snapshot on a
+    # good reading.
+    try:
+        mod._refresh_official_cache()
+    except Exception:
+        pass
+    cache = mod._read_official_cache()
     for slug, label in mod._configured_providers():
         try:
-            # _provider records the last-good disk snapshot itself on a good read
-            # (status == "ok" with windows), so simply calling it seeds the cache
-            # the wedged dashboard falls back to.
-            result = mod._provider(slug, label)
+            result = mod._provider(slug, label, cache)
             if result.get("status") == "ok" and result.get("windows"):
                 seeded += 1
         except Exception:
