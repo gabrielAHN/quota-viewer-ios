@@ -6,15 +6,12 @@ import re
 import socket
 import time
 import urllib.request
-import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Query, Response
-
-from agent.account_usage import fetch_account_usage
 
 router = APIRouter()
 
@@ -59,11 +56,10 @@ def _configured_providers() -> tuple[tuple[str, str], ...]:
 
 
 CACHE_SECONDS = 60
-# The shortest interval a forced ?refresh=true is allowed to actually hit upstream.
+# The shortest interval a forced ?refresh=true is allowed to trigger a real re-fetch.
 # The menu-bar reader asks for a refresh on every poll (a few seconds apart); each
 # real refresh makes a live usage call per provider, and Anthropic's usage endpoint
-# 429s under that cadence — which core turns into None → "sign in", blanking a
-# provider that actually has quota. Keep forced refreshes from out-pacing upstream.
+# 429s under that cadence. Keep forced refreshes from out-pacing upstream.
 _MIN_REFRESH_SECONDS = 30
 _cache: dict[str, Any] | None = None
 _cache_at = 0.0
@@ -95,172 +91,168 @@ _LAST_GOOD_PATH = os.path.join(
 )
 
 
-class _TransientQuotaError(Exception):
-    """A recoverable upstream error (HTTP 429 / 5xx) — the credential is fine, the
-    provider API is just temporarily unavailable. Distinguished from a real auth
-    failure so the caller keeps the last-good reading instead of showing
-    signed-out."""
-
-    def __init__(self, code: int) -> None:
-        super().__init__(f"transient upstream error {code}")
-        self.code = code
-
-
 def _iso(value: datetime | None) -> str | None:
     if value is None:
         return None
     return value.astimezone(timezone.utc).isoformat()
 
 
-def _file_anthropic_token() -> str | None:
-    """Resolve the gateway's `claude login` OAuth token from the credentials FILE
-    (refreshing if needed). On macOS, Hermes' account_usage reads the login
-    Keychain first, whose Claude session can be expired even though the file token
-    (kept fresh by the ACP bridge) is valid — that's why Claude can read as
-    "authentication required" on the gateway despite a working `claude` login.
-    Reading the file directly sidesteps that, and stays linked to the gateway's
-    own subscription."""
+# --- Quota source: the official `quota` plugin (github.com/rarf/hermes-quota-plugin) ---
+# This plugin no longer fetches provider usage itself. The reviewed catalog plugin
+# owns the fetchers and writes `$HERMES_HOME/quota_cache.json`; we adapt that cache
+# to the QuotaPayload shape the menu-bar app already speaks, keeping the last-good
+# masking so a transient fetch failure never blanks a provider that has quota.
+
+# Official-cache unavailable_reason → our status. Reasons that mean "the gateway has
+# no credential" map to authentication_required (the menu renders a sign-in row);
+# everything else (fetch-error, timeout, no-data) is a transient unavailable that
+# last-good masking absorbs.
+_AUTH_REASONS = {"no-credentials", "not-logged-in", "opt-in-disabled"}
+
+
+def _read_official_cache() -> dict[str, Any]:
+    """Read the official plugin's quota_cache.json directly (schema documented in
+    the plugin: {fetched_at, providers: {slug: {label, plan, unavailable_reason,
+    details, windows: [{label, used_percent, reset_at}]}}})."""
     try:
-        # These live in agent.anthropic_credentials on current Hermes; older cores
-        # exported them from agent.anthropic_adapter. Try the current path first,
-        # then fall back, so this fallback keeps working across core versions
-        # instead of silently ImportError-ing (which collapsed Claude to "sign in"
-        # whenever the primary account_usage path had a blip).
-        try:
-            from agent.anthropic_credentials import (
-                _read_claude_code_credentials_from_file,
-                _refresh_oauth_token,
-                is_claude_code_token_valid,
-            )
-        except ImportError:
-            from agent.anthropic_adapter import (
-                _read_claude_code_credentials_from_file,
-                _refresh_oauth_token,
-                is_claude_code_token_valid,
-            )
-        creds = _read_claude_code_credentials_from_file()
-        if not creds:
-            return None
-        if is_claude_code_token_valid(creds):
-            return (creds.get("accessToken") or "").strip() or None
-        return (_refresh_oauth_token(creds) or "").strip() or None
+        with open(_hermes_home() / "quota_cache.json", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and isinstance(data.get("providers"), dict):
+            return data
+    except Exception:
+        pass
+    return {"fetched_at": None, "providers": {}}
+
+
+def _cache_age_seconds(cache: dict[str, Any]) -> float | None:
+    ts = cache.get("fetched_at")
+    if not ts:
+        return None
+    try:
+        fetched = datetime.fromisoformat(ts)
+        if fetched.tzinfo is None:
+            fetched = fetched.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - fetched).total_seconds()
     except Exception:
         return None
 
 
-def _anthropic_direct(label: str) -> dict[str, Any] | None:
-    """Query the Anthropic OAuth usage API with the gateway's file token, used as
-    a fallback when account_usage can't (stale login-Keychain session). Mirrors
-    account_usage's anthropic window mapping.
+def _refresh_official_cache() -> None:
+    """Run the official plugin's sweep in a FRESH subprocess, never in-process.
 
-    A transient HTTP 429 (rate limit) is NOT an auth failure: the token is valid,
-    the API is just busy. Retry a couple of times with a short backoff, and raise
-    on a persistent 429 so the caller can keep the last-good reading instead of
-    collapsing Claude to "authentication_required" (which reads as signed-out)."""
-    token = _file_anthropic_token()
-    if not token or not token.startswith("sk-ant-oat"):
-        return None
-    payload = None
-    for attempt in range(3):
-        try:
-            req = urllib.request.Request(
-                "https://api.anthropic.com/api/oauth/usage",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Accept": "application/json",
-                    "anthropic-beta": "oauth-2025-04-20",
-                    "User-Agent": "claude-code/2.1.0",
-                },
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                payload = json.load(resp) or {}
-            break
-        except urllib.error.HTTPError as exc:
-            # 429 / 5xx are transient: back off and retry, then signal the caller.
-            if exc.code == 429 or 500 <= exc.code < 600:
-                if attempt < 2:
-                    time.sleep(1.5 * (attempt + 1))
-                    continue
-                raise _TransientQuotaError(exc.code)
-            return None
-        except Exception:
-            if attempt < 2:
-                time.sleep(1.0)
-                continue
-            return None
-    if payload is None:
-        return None
+    The long-lived dashboard process rots: after hours, credential reads that
+    work in a fresh interpreter fail in-process (anthropic → no-credentials,
+    openrouter → no-data), which is exactly the false-signout class this app
+    exists to avoid. A fresh interpreter per sweep sidesteps the rot entirely;
+    the plugin's own REFRESH_BUDGET_S bounds the sweep and our timeout backstops
+    a wedged child. The interpreter must be the HERMES VENV python (so the
+    plugin's imports — hermes_constants, agent.account_usage — resolve): inside
+    the dashboard that is sys.executable, but the last-good refresher runs under
+    system python3, so probe the known venv locations first."""
+    import subprocess
+    import sys
+    root = _hermes_home() / "plugins" / "quota"
+    if not (root / "quota_cache.py").is_file():
+        return
+    python = next(
+        (str(c) for c in (
+            Path.home() / ".hermes/hermes-agent/venv/bin/python3",
+            Path.home() / ".hermes/hermes-agent/.venv/bin/python3",
+        ) if c.is_file()),
+        sys.executable,
+    )
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(_hermes_home())
+    code = (
+        "import sys; sys.path.insert(0, %r); "
+        "from quota.quota_cache import refresh_quota_cache; refresh_quota_cache()"
+    ) % str(root.parent)
+    try:
+        subprocess.run(
+            [python, "-c", code],
+            env=env, timeout=60,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+def _adapt_record(slug: str, label: str, rec: dict[str, Any], fetched_at: str | None) -> dict[str, Any]:
+    """One official-cache provider record → the menu-bar QuotaPayload provider shape."""
+    reason = rec.get("unavailable_reason")
     windows = []
-    for key, wlabel in (
-        ("five_hour", "Current session"),
-        ("seven_day", "Current week"),
-        ("seven_day_opus", "Opus week"),
-        ("seven_day_sonnet", "Sonnet week"),
-    ):
-        window = payload.get(key) or {}
-        util = window.get("utilization")
-        if util is None:
-            continue
-        # `utilization` from the OAuth usage API is a PERCENT (0-100), e.g. 34.0 /
-        # 2.0 — not a 0-1 fraction. Take it as-is (clamped). The old "if <= 1,
-        # multiply by 100" guess inverted a barely-used window into a full one — a
-        # fresh session at 1% utilization became 100% used → "no quota" — and
-        # disagreed with the primary account_usage path, which uses the raw percent.
-        used = max(0.0, min(100.0, float(util)))
+    for w in rec.get("windows") or []:
+        used = w.get("used_percent")
+        used = None if used is None else max(0.0, min(100.0, float(used)))
         windows.append({
-            "label": wlabel,
+            "label": w.get("label") or "window",
             "used_percent": used,
-            "remaining_percent": 100.0 - used,
+            "remaining_percent": None if used is None else 100.0 - used,
             "remaining_amount": None,
             "currency": None,
-            "resets_at": window.get("resets_at"),
+            "resets_at": w.get("reset_at"),
             "detail": None,
-            "warning": used >= 85.0,
+            "warning": used is not None and used >= 85.0,
         })
-    if not windows:
-        return None
+    details = [str(d) for d in (rec.get("details") or [])]
+    if slug == "openrouter":
+        # Same courtesy as before: lift the credits balance into a window row.
+        balance = None
+        for line in details:
+            match = re.search(r"Credits balance:\s*\$([0-9]+(?:\.[0-9]+)?)", line)
+            if match:
+                balance = float(match.group(1))
+                break
+        if balance is not None:
+            details = [d for d in details if not d.startswith("Credits balance:")]
+            windows.insert(0, {
+                "label": "Account credits",
+                "used_percent": None,
+                "remaining_percent": None,
+                "remaining_amount": balance,
+                "currency": "USD",
+                "resets_at": None,
+                "detail": f"${balance:.2f} available",
+                "warning": balance <= 0.0,
+            })
+    if reason in _AUTH_REASONS:
+        status = "authentication_required"
+        message = f"Sign in to {label} on the gateway."
+    elif reason:
+        status = "unavailable"
+        message = f"{label} usage is unavailable ({reason}) — try again shortly."
+    else:
+        status = "ok" if windows else "unavailable"
+        message = None if windows else f"{label} reported no usage windows."
     return {
-        "provider": "anthropic",
+        "provider": slug,
         "label": label,
-        "status": "ok",
-        "source": "oauth_usage_api (file token)",
-        "plan": None,
-        "fetched_at": _iso(datetime.now(timezone.utc)),
+        "status": status,
+        "source": "quota plugin cache",
+        "plan": rec.get("plan"),
+        "fetched_at": fetched_at,
         "windows": windows,
-        "details": [],
-        "message": None,
+        "details": details,
+        "message": message,
     }
 
 
-def _provider(provider: str, label: str) -> dict[str, Any]:
-    result = _provider_via_account_usage(provider, label)
-    # Claude on a gateway whose login-Keychain session is stale reads as
-    # authentication_required even though the `claude login` file token works —
-    # fall back to querying usage with that file token so it still shows.
-    if provider == "anthropic" and result.get("status") != "ok":
-        try:
-            fallback = _anthropic_direct(label)
-        except _TransientQuotaError:
-            # Rate-limited / upstream busy — NOT signed out. Keep the last-good
-            # reading if we have a recent one; otherwise report it as a temporary
-            # blip rather than "sign in".
-            fallback = None
-            cached = _fresh_last_good(provider)
-            if cached is not None:
-                return cached
-            result = {
-                "provider": provider,
-                "label": label,
-                "status": "unavailable",
-                "source": None,
-                "plan": None,
-                "fetched_at": None,
-                "windows": [],
-                "details": [],
-                "message": f"{label} usage is rate limited — try again shortly.",
-            }
-        if fallback is not None:
-            result = fallback
+def _provider(provider: str, label: str, cache: dict[str, Any]) -> dict[str, Any]:
+    rec = cache.get("providers", {}).get(provider)
+    if isinstance(rec, dict):
+        result = _adapt_record(provider, label, rec, cache.get("fetched_at"))
+    else:
+        result = {
+            "provider": provider,
+            "label": label,
+            "status": "unavailable",
+            "source": None,
+            "plan": None,
+            "fetched_at": None,
+            "windows": [],
+            "details": [],
+            "message": f"{label} has no reading yet — run `hermes quota refresh` on the gateway.",
+        }
     # A good reading refreshes the last-good cache; a bad one is masked by a recent
     # last-good so a transient failure never blanks a provider that has quota.
     if result.get("status") == "ok" and result.get("windows"):
@@ -301,12 +293,9 @@ def _read_last_good_file() -> dict[str, Any]:
 def _fresh_last_good(provider: str) -> dict[str, Any] | None:
     # Two sources of a last-good reading, both wall-clock stamped so they can be
     # compared across processes: this process's own in-process reading, and the
-    # on-disk mirror the refresher (or another reader) keeps current. Return the
-    # NEWER of the two within TTL — critically, NOT "in-process first". A
-    # long-lived dashboard whose live reads have rotted keeps a stale in-process
-    # reading indefinitely; preferring it would ignore the fresh disk reading the
-    # refresher writes precisely to hand this wedged process a current value. So
-    # whichever was recorded more recently by wall clock wins.
+    # on-disk mirror another reader may keep current. Return the NEWER of the two
+    # within TTL — critically, NOT "in-process first": a wedged process's stale
+    # in-process reading must not shadow a fresh disk reading.
     now = time.time()
     in_proc = _last_good.get(provider)
     in_proc_wall = _last_good_wall.get(provider, 0.0)
@@ -329,96 +318,6 @@ def _fresh_last_good(provider: str) -> dict[str, Any] | None:
     return in_proc if in_proc_fresh else None
 
 
-def _provider_via_account_usage(provider: str, label: str) -> dict[str, Any]:
-    snapshot = fetch_account_usage(provider)
-    if snapshot is None:
-        # core's fetch_account_usage() swallows EVERY error to None — a real
-        # signed-out AND a transient 429/5xx/network blip look identical here.
-        # Rather than always saying "sign in" (which blanks a provider that has
-        # quota during a blip), prefer a recent last-good reading; only when we
-        # have never seen this provider succeed do we surface the sign-in prompt.
-        cached = _fresh_last_good(provider)
-        if cached is not None:
-            return cached
-        return {
-            "provider": provider,
-            "label": label,
-            "status": "authentication_required",
-            "source": None,
-            "plan": None,
-            "fetched_at": None,
-            "windows": [],
-            "details": [],
-            "message": f"Sign in to {label} on the gateway.",
-        }
-    windows = []
-    for window in snapshot.windows:
-        used = None if window.used_percent is None else max(0.0, min(100.0, float(window.used_percent)))
-        remaining_amount = getattr(window, "remaining_amount", None)
-        remaining_amount = None if remaining_amount is None else max(0.0, float(remaining_amount))
-        window_label = window.label
-        if provider == "openai-codex" and window.reset_at is not None:
-            # The Codex/ChatGPT usage API only conveys the window length via
-            # limit_window_seconds, which account_usage drops before we see it —
-            # and on Plus the single returned window is the 7-day allowance yet
-            # core hardcodes its label to "Session". Re-derive from the reset
-            # distance: a reset >2 days out is the weekly quota, otherwise it's
-            # the ~5h session window.
-            now = datetime.now(window.reset_at.tzinfo or timezone.utc)
-            seconds_to_reset = (window.reset_at - now).total_seconds()
-            window_label = "Weekly" if seconds_to_reset > 2 * 86400 else "Session"
-        windows.append(
-            {
-                "label": window_label,
-                "used_percent": used,
-                "remaining_percent": None if used is None else 100.0 - used,
-                "remaining_amount": remaining_amount,
-                "currency": getattr(window, "currency", None),
-                "resets_at": _iso(window.reset_at),
-                "detail": window.detail,
-                "warning": (used is not None and used >= 85.0)
-                or (remaining_amount is not None and remaining_amount <= 0.0),
-            }
-        )
-    details = list(snapshot.details)
-    if provider == "openrouter":
-        # Surface the OpenRouter credit balance instead of a bare "ok". account_usage
-        # only reports it as a "Credits balance: $N" detail string (from the gateway's
-        # own credentials — respecting the gateway's access), so lift the number into
-        # an "Account credits" window the renderer can show, and drop the now-duplicate
-        # detail line while keeping the rest (e.g. "API key usage: …").
-        balance = None
-        for line in details:
-            match = re.search(r"Credits balance:\s*\$([0-9]+(?:\.[0-9]+)?)", line)
-            if match:
-                balance = float(match.group(1))
-                break
-        if balance is not None:
-            details = [d for d in details if not d.startswith("Credits balance:")]
-            windows.insert(0, {
-                "label": "Account credits",
-                "used_percent": None,
-                "remaining_percent": None,
-                "remaining_amount": balance,
-                "currency": "USD",
-                "resets_at": None,
-                "detail": f"${balance:.2f} available",
-                "warning": balance <= 0.0,
-            })
-    status = "ok" if snapshot.available else "unavailable"
-    return {
-        "provider": provider,
-        "label": label,
-        "status": status,
-        "source": snapshot.source,
-        "plan": snapshot.plan,
-        "fetched_at": _iso(snapshot.fetched_at),
-        "windows": windows,
-        "details": details,
-        "message": snapshot.unavailable_reason,
-    }
-
-
 def _load(refresh: bool) -> dict[str, Any]:
     global _cache, _cache_at
     now = time.monotonic()
@@ -427,16 +326,22 @@ def _load(refresh: bool) -> dict[str, Any]:
         if not refresh and _cache is not None and now - _cache_at < CACHE_SECONDS:
             return _cache
         # A forced refresh (?refresh=true) still honours a MINIMUM interval: the
-        # menu-bar reader requests refresh on every poll, and each miss makes a live
-        # upstream usage call per provider. Anthropic's usage API rate-limits that
-        # quickly (HTTP 429 → account_usage returns None → provider reads as
-        # "sign in"), so refreshing faster than the upstream tolerates is what
-        # BLANKS the quota. Below the floor a forced refresh returns the last cache
-        # instead of hammering upstream.
+        # menu-bar reader requests refresh on every poll, and each real refresh
+        # runs the plugin's provider sweep (live upstream usage calls). Anthropic's
+        # usage API rate-limits that quickly, so refreshing faster than the
+        # upstream tolerates is what BLANKS the quota. Below the floor a forced
+        # refresh returns the last payload instead of hammering upstream.
         if _cache is not None and now - _cache_at < _MIN_REFRESH_SECONDS:
             return _cache
+        official = _read_official_cache()
+        age = _cache_age_seconds(official)
+        # Re-sweep when the official cache is stale (or a refresh was asked and it
+        # is older than the refresh floor); the plugin's own budget bounds it.
+        if age is None or age > CACHE_SECONDS or (refresh and age > _MIN_REFRESH_SECONDS):
+            _refresh_official_cache()
+            official = _read_official_cache()
         configured = _configured_providers()
-        providers = [_provider(slug, label) for slug, label in configured]
+        providers = [_provider(slug, label, official) for slug, label in configured]
         _cache = {
             # broker identifies the gateway host these quotas belong to, so a
             # client can tell which gateway it's linked to.
