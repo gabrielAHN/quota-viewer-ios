@@ -10,24 +10,20 @@
 # on any failure prints a one-line reason to stderr and exits non-zero.
 set -euo pipefail
 exec /usr/bin/env python3 - "$@" <<'PY'
-import base64, hashlib, json, subprocess, sys, urllib.request, urllib.error
+import base64, hashlib, json, subprocess, sys, time, urllib.request, urllib.error
 from pathlib import Path
 
 SUPPORT = Path.home() / "Library/Application Support/Hermes"
 # Optional args: $1 = gateway endpoint path (default: the quotas endpoint),
 # $2 = output file for binary bodies (e.g. a pet spritesheet); otherwise the
 # body is written to stdout.
-ENDPOINT = sys.argv[1] if len(sys.argv) > 1 else "/api/plugins/provider-quota/quotas?refresh=true"
+ENDPOINT = sys.argv[1] if len(sys.argv) > 1 else "/api/plugins/provider-quota/quotas"
 OUT = sys.argv[2] if len(sys.argv) > 2 else None
 ACTIVITY = ENDPOINT == "--activity"
-# Activity polls run on the menu-bar's 1s timer and only read session lists, so a
-# slow gateway call must fail FAST — a 20s hang would stall the in-flight guard
-# and make a session's dot appear (or clear) many seconds late. Quota fetches hit
-# slow provider APIs, so they keep the generous timeout.
-TIMEOUT = 6 if ENDPOINT == "--activity" else 20
+TIMEOUT = 2 if ACTIVITY else 5
 
 
-def fail(msg):
+def fail(msg, code=1):
     # In --activity mode a broken PRIMARY connection (signed out, expired token,
     # unreachable) must NOT kill the whole scan — the local Desktop-spawned backend
     # is read separately and still has live sessions. Raise a catchable error there;
@@ -35,7 +31,7 @@ def fail(msg):
     if ACTIVITY:
         raise _PrimaryUnavailable(msg)
     sys.stderr.write(msg.rstrip() + "\n")
-    sys.exit(1)
+    sys.exit(code)
 
 
 class _PrimaryUnavailable(Exception):
@@ -51,10 +47,14 @@ def emit(data):
 
 
 def read_json(name):
-    try:
-        return json.loads((SUPPORT / name).read_text())
-    except Exception:
-        return None
+    for delay in (0, 0.05, 0.1, 0.2):
+        if delay:
+            time.sleep(delay)
+        try:
+            return json.loads((SUPPORT / name).read_text())
+        except (OSError, ValueError):
+            continue
+    return None
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -138,118 +138,65 @@ try:
     else:
         if not url:
             fail("Hermes Desktop has no gateway configured.")
-        tokens = read_json("native-oauth-tokens.json")
-        if tokens is None:
-            fail("Sign in to Hermes Desktop.")
-        entry = tokens.get(url) or next((v for k, v in tokens.items() if _norm(k) == _norm(url)), None)
-        if not entry:
-            fail("Sign in to Hermes Desktop (%s)." % url)
-
-        value = entry.get("value") or ""
         _ss_key = None
-        if entry.get("encoding") == "safeStorage":
-            # Electron safeStorage v10: AES-128-CBC, key = PBKDF2-HMAC-SHA1(secret,
-            # "saltysalt", 1003, 16), IV = 16 spaces. Decrypt with openssl to avoid a
-            # python crypto dependency.
+
+        def desktop_access_token():
+            global _ss_key
+            tokens = read_json("native-oauth-tokens.json")
+            if tokens is None:
+                if not (SUPPORT / "native-oauth-tokens.json").exists():
+                    fail("Sign in to Hermes Desktop.", 2)
+                fail("Cannot read Hermes Desktop session — retrying.")
+            entry = tokens.get(url) or next((v for k, v in tokens.items() if _norm(k) == _norm(url)), None)
+            if not entry:
+                fail("Sign in to Hermes Desktop (%s)." % url, 2)
+            value = entry.get("value") or ""
             try:
-                secret = subprocess.check_output(
-                    ["security", "find-generic-password", "-s", "Hermes Safe Storage", "-w"],
-                    stderr=subprocess.DEVNULL,
-                ).decode().strip()
-            except Exception as exc:
-                fail("Cannot read 'Hermes Safe Storage' Keychain key: %s" % exc)
-            _ss_key = hashlib.pbkdf2_hmac("sha1", secret.encode(), b"saltysalt", 1003, dklen=16)
-            raw = base64.b64decode(value)
-            if raw[:3] != b"v10":
-                fail("Unexpected Hermes Desktop token format.")
-            proc = subprocess.run(
-                ["openssl", "enc", "-d", "-aes-128-cbc", "-K", _ss_key.hex(),
-                 "-iv", "20" * 16, "-nopad"],
-                input=raw[3:], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            )
-            plaintext = proc.stdout
-            if not plaintext:
-                fail("Cannot decrypt Hermes Desktop session token (openssl).")
-            plaintext = plaintext[: -plaintext[-1]]  # strip PKCS7 padding
-            session = json.loads(plaintext.decode())
-        else:
-            session = json.loads(value)
+                if entry.get("encoding") == "safeStorage":
+                    if _ss_key is None:
+                        secret = subprocess.check_output(
+                            ["security", "find-generic-password", "-s", "Hermes Safe Storage", "-w"],
+                            stderr=subprocess.DEVNULL, timeout=3,
+                        ).decode().strip()
+                        _ss_key = hashlib.pbkdf2_hmac("sha1", secret.encode(), b"saltysalt", 1003, dklen=16)
+                    raw = base64.b64decode(value)
+                    if raw[:3] != b"v10":
+                        fail("Unexpected Hermes Desktop token format.")
+                    proc = subprocess.run(
+                        ["openssl", "enc", "-d", "-aes-128-cbc", "-K", _ss_key.hex(),
+                         "-iv", "20" * 16, "-nopad"],
+                        input=raw[3:], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3,
+                    )
+                    plaintext = proc.stdout
+                    if proc.returncode or not plaintext:
+                        fail("Cannot decrypt Hermes Desktop session token.")
+                    pad = plaintext[-1]
+                    if not 1 <= pad <= 16 or plaintext[-pad:] != bytes([pad]) * pad:
+                        fail("Cannot decrypt Hermes Desktop session token.")
+                    session = json.loads(plaintext[:-pad].decode())
+                else:
+                    session = json.loads(value)
+            except (ValueError, OSError, subprocess.SubprocessError):
+                fail("Cannot read Hermes Desktop session — retrying.")
+            token = session.get("accessToken") or ""
+            if not token:
+                fail("Sign in to Hermes Desktop.", 2)
+            return token
 
-        access_token = session.get("accessToken") or ""
-        if not access_token:
-            fail("Sign in to Hermes Desktop.")
+        access_token = desktop_access_token()
 
-        # --- Self-heal an expired session: the gateway's access token lives ~12h;
-        # when Hermes Desktop isn't running to rotate it, the menu-bar used to read
-        # "Disconnected" until the next manual sign-in even though the gateway was
-        # fine. If the token is (nearly) expired and a refresh token exists, rotate
-        # it through the gateway's native refresh route and persist the rotated
-        # pair back for the Desktop. Persisting is REQUIRED, not best-effort:
-        # Authelia rotates refresh tokens with reuse detection, so a rotated-but-
-        # unsaved RT would strand the on-disk one and revoke the whole session on
-        # its next use — if we cannot write the file we don't rotate at all (the
-        # gateway's single-flight replay window still dedupes a Desktop that
-        # refreshes concurrently). ---
-        def _persist_session(sess, _entry=entry, _tokens=tokens, _key=_ss_key):
-            plain = json.dumps(sess).encode()
-            if _entry.get("encoding") == "safeStorage":
-                if _key is None:
-                    return False
-                pad = 16 - len(plain) % 16
-                proc = subprocess.run(
-                    ["openssl", "enc", "-aes-128-cbc", "-K", _key.hex(),
-                     "-iv", "20" * 16, "-nopad"],
-                    input=plain + bytes([pad]) * pad,
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                )
-                if not proc.stdout:
-                    return False
-                _entry["value"] = base64.b64encode(b"v10" + proc.stdout).decode()
-            else:
-                _entry["value"] = json.dumps(sess)
-            try:
-                path = SUPPORT / "native-oauth-tokens.json"
-                tmp = path.with_suffix(".json.tmp")
-                tmp.write_text(json.dumps(_tokens))
-                tmp.replace(path)
-                return True
-            except Exception:
-                return False
-
-        import time as _time
-        expires_at = session.get("expiresAt") or 0
-        refresh_token = session.get("refreshToken") or ""
-        if refresh_token and isinstance(expires_at, (int, float)) and expires_at > 0 \
-                and _time.time() >= expires_at - 120:
-            try:
-                req = urllib.request.Request(
-                    url + "/auth/native/refresh",
-                    data=json.dumps({"refresh_token": refresh_token,
-                                     "provider": session.get("provider") or ""}).encode(),
-                    headers={"Content-Type": "application/json", "Accept": "application/json",
-                             "User-Agent": _USER_AGENT},
-                )
-                with _opener.open(req, timeout=TIMEOUT) as resp:
-                    body = json.loads(resp.read())
-                new_access = body.get("access_token") or ""
-                if new_access:
-                    session["accessToken"] = new_access
-                    session["refreshToken"] = body.get("refresh_token") or refresh_token
-                    if body.get("expires_at"):
-                        session["expiresAt"] = body["expires_at"]
-                    if _persist_session(session):
-                        access_token = new_access
-                    # Persist failed: keep the OLD access token (do not adopt a
-                    # rotation we could not save) — it may still work briefly.
-            except urllib.error.HTTPError as exc:
-                if exc.code == 401:
-                    fail("Hermes Desktop session expired — open Hermes Desktop to sign in again.")
-                # 5xx / 503: gateway busy — fall through with the old token.
-            except Exception:
-                pass  # network blip: fall through with the old token
-
-        def fetch(path, _url=url, _tok=access_token):
-            return http_get(_url + path, {"Authorization": "Bearer " + _tok, "Accept": "*/*"})
+        def fetch(path):
+            global access_token
+            status, body = http_get(url + path, {"Authorization": "Bearer " + access_token, "Accept": "*/*"})
+            if status != 401:
+                return status, body
+            for delay in (0.1, 0.3, 0.6):
+                time.sleep(delay)
+                current = desktop_access_token()
+                if current != access_token:
+                    access_token = current
+                    return http_get(url + path, {"Authorization": "Bearer " + access_token, "Accept": "*/*"})
+            return status, body
 
         EXPIRED_MSG = "Hermes gateway returned HTTP %s."
 except _PrimaryUnavailable:
@@ -259,14 +206,22 @@ except _PrimaryUnavailable:
 
 
 def get_json(path):
+    global fetch
     if fetch is None:
         return None
-    status, body = fetch(path)
+    try:
+        status, body = fetch(path)
+    except _PrimaryUnavailable:
+        fetch = None
+        return None
     if status != 200:
+        if status != 404:
+            fetch = None
         return None
     try:
         return json.loads(body)
-    except Exception:
+    except (ValueError, UnicodeError):
+        fetch = None
         return None
 
 
@@ -575,8 +530,8 @@ if ENDPOINT == "--activity":
 
 # --- Normal single-endpoint mode. ---
 status, body = fetch(ENDPOINT)
-if kind != "local" and status in (301, 302, 303, 307, 308, 401, 403):
-    fail("Hermes Desktop session expired — open Hermes Desktop to refresh.")
+if kind != "local" and status == 401:
+    fail("Hermes Desktop session expired — open Hermes Desktop to refresh.", 2)
 if status != 200:
     fail(EXPIRED_MSG % status)
 emit(body)
