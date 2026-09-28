@@ -59,6 +59,26 @@ print(String(data: try JSONSerialization.data(withJSONObject: result), encoding:
     def window(self, label, percent=None, **metadata):
         return dict(label=label, remaining_percent=percent, warning=False, **metadata)
 
+    def test_percent_summary_identifies_used_and_remaining_for_all_providers(self):
+        for provider in ("openai-codex", "anthropic", "openrouter", "opencode", "antigravity", "future-provider"):
+            with self.subTest(provider=provider):
+                result = self.policy([self.window("Primary", 13, scope="account", window_seconds=604800)], provider)
+                self.assertEqual(result["summary"], "Weekly · 87% used · 13% left")
+
+    def test_source_monthly_labels_are_not_fixed_thirty_day_windows(self):
+        for provider in ("openai-codex", "anthropic", "openrouter", "opencode", "antigravity", "future-provider"):
+            with self.subTest(provider=provider):
+                monthly = self.window("Current month", 13)
+                model = self.window("Model", 0, scope="model")
+                result = self.policy([model, monthly], provider)
+                self.assertEqual(result["summary"], "Monthly · 87% used · 13% left")
+                self.assertFalse(result["exhausted"])
+                for label in ("Primary", "Monthly", "Current month"):
+                    fixed = self.window(label, 13, window_seconds=2592000, scope="account")
+                    self.assertEqual(self.policy([fixed], provider)["summary"], "30d · 87% used · 13% left")
+                calendar = self.window("Calendar month", 13, scope="account")
+                self.assertEqual(self.policy([calendar], provider)["summary"], "Calendar month · 87% used · 13% left")
+
     def test_metadata_roundtrip_and_legacy_decode(self):
         window = self.window("Primary", 80, window_seconds=604800.0, scope="account", window_id="primary")
         result = self.policy([window, self.window("Weekly", 30)])
@@ -93,7 +113,7 @@ print(String(data: try JSONSerialization.data(withJSONObject: result), encoding:
                    self.window("Weekly", 40, scope="account", window_seconds=604800, window_id="secondary")]
         result = self.policy(windows, "anthropic")
         self.assertEqual(result["percent"], 75)
-        self.assertEqual(result["summary"], "5h · 75% left")
+        self.assertEqual(result["summary"], "5h · 25% used · 75% left")
         windows[2]["remaining_percent"] = 0
         windows[2]["resets_at"] = "2098-01-01T00:00:00Z"
         result = self.policy(windows, "anthropic")
@@ -106,15 +126,15 @@ print(String(data: try JSONSerialization.data(withJSONObject: result), encoding:
         for seconds, label in cases:
             with self.subTest(seconds=seconds):
                 result = self.policy([self.window("Primary", 62, scope="account", window_id="primary", window_seconds=seconds)])
-                self.assertEqual(result["summary"], f"{label} · 62% left")
+                self.assertEqual(result["summary"], f"{label} · 38% used · 62% left")
         for label, expected in (("Session", "Primary"), ("Current session", "Primary"), ("Weekly", "Secondary")):
-            self.assertEqual(self.policy([self.window(label, 62)])["summary"], f"{expected} · 62% left")
+            self.assertEqual(self.policy([self.window(label, 62)])["summary"], f"{expected} · 38% used · 62% left")
         reserve = self.window("Primary", 62, scope="gpt-reserve", window_id="primary", window_seconds=604800)
-        self.assertEqual(self.policy([reserve])["summary"], "gpt-reserve · Weekly · 62% left")
+        self.assertEqual(self.policy([reserve])["summary"], "gpt-reserve · Weekly · 38% used · 62% left")
         reserve.pop("window_seconds")
-        self.assertEqual(self.policy([reserve])["summary"], "gpt-reserve · Primary · 62% left")
-        self.assertEqual(self.policy([self.window("Current week", 62)], "anthropic")["summary"], "Current week · 62% left")
-        self.assertEqual(self.policy([self.window("Budget", 62)], "unknown")["summary"], "Budget · 62% left")
+        self.assertEqual(self.policy([reserve])["summary"], "gpt-reserve · Primary · 38% used · 62% left")
+        self.assertEqual(self.policy([self.window("Current week", 62)], "anthropic")["summary"], "Current week · 38% used · 62% left")
+        self.assertEqual(self.policy([self.window("Budget", 62)], "unknown")["summary"], "Budget · 38% used · 62% left")
 
     def test_credit_and_unknown_usage_never_get_percentage_bars(self):
         for provider in ("openrouter", "opencode", "future-provider"):
@@ -138,14 +158,14 @@ print(String(data: try JSONSerialization.data(withJSONObject: result), encoding:
     def test_reader_reserve_labels_remain_distinct_without_duplicate_duration(self):
         for label in ("gpt-reserve Weekly", "gpt-reserve · Weekly"):
             result = self.policy([self.window(label, 45, scope="gpt-reserve", window_seconds=604800, window_id="primary")])
-            self.assertEqual(result["summary"], "gpt-reserve · Weekly · 45% left")
+            self.assertEqual(result["summary"], "gpt-reserve · Weekly · 55% used · 45% left")
         result = self.policy([self.window("gpt-reserve Session", 45, scope="gpt-reserve", window_id="primary")])
-        self.assertEqual(result["summary"], "gpt-reserve · Primary · 45% left")
+        self.assertEqual(result["summary"], "gpt-reserve · Primary · 55% used · 45% left")
 
     def test_reader_duration_labels_do_not_repeat_duration(self):
         for label, seconds, expected in (("2d quota", 172800, "2d"), ("24h quota", 86400, "1d"), ("Primary quota", 604800, "Weekly")):
             result = self.policy([self.window(label, 60, scope="account", window_seconds=seconds, window_id="primary")])
-            self.assertEqual(result["summary"], f"{expected} · 60% left")
+            self.assertEqual(result["summary"], f"{expected} · 40% used · 60% left")
 
     def test_known_short_weekly_and_weekly_only_selection(self):
         short = self.window("Session", 71, scope="account", window_seconds=18000, window_id="primary")
@@ -157,7 +177,7 @@ print(String(data: try JSONSerialization.data(withJSONObject: result), encoding:
         primary_weekly = dict(weekly, window_id="primary")
         result = self.policy([reserve, primary_weekly])
         self.assertEqual(result["percent"], 20)
-        self.assertEqual(result["summary"], "Weekly · 20% left")
+        self.assertEqual(result["summary"], "Weekly · 80% used · 20% left")
         self.assertFalse(result["exhausted"])
         result = self.policy([self.window("Model A", 0), self.window("Model B", 40)])
         self.assertEqual(result["summary"], "Model A · Limit reached")
@@ -169,7 +189,7 @@ print(String(data: try JSONSerialization.data(withJSONObject: result), encoding:
     def test_legacy_codex_reserve_labels_are_neutral_without_metadata(self):
         for raw, expected in (("gpt-reserve Session", "gpt-reserve · Primary"), ("gpt-reserve Weekly", "gpt-reserve · Secondary")):
             result = self.policy([self.window(raw, 65)])
-            self.assertEqual(result["summary"], f"{expected} · 65% left")
+            self.assertEqual(result["summary"], f"{expected} · 35% used · 65% left")
 
     def test_api_key_scope_blocks_current_credential_without_becoming_account_scope(self):
         account = self.window("Account credits", remaining_amount=10, currency="USD", scope="account")
@@ -187,14 +207,14 @@ print(String(data: try JSONSerialization.data(withJSONObject: result), encoding:
 
     def test_live_human_bucket_labels_override_opaque_scope_names(self):
         reserve = self.window("gpt-reserve · Weekly", 42, scope="base_model_inference", window_id="primary", window_seconds=604800)
-        self.assertEqual(self.policy([reserve])["summary"], "gpt-reserve · Weekly · 42% left")
+        self.assertEqual(self.policy([reserve])["summary"], "gpt-reserve · Weekly · 58% used · 42% left")
         opus = self.window("Opus week", 42, scope="opus", window_seconds=604800)
-        self.assertEqual(self.policy([opus], "anthropic")["summary"], "Opus · Weekly · 42% left")
+        self.assertEqual(self.policy([opus], "anthropic")["summary"], "Opus · Weekly · 58% used · 42% left")
 
     def test_positive_fraction_is_not_exhausted(self):
         result = self.policy([self.window("Session", 0.4)])
         self.assertFalse(result["exhausted"])
-        self.assertEqual(result["summary"], "Primary · <1% left")
+        self.assertEqual(result["summary"], "Primary · >99% used · <1% left")
 
 
 if __name__ == "__main__":

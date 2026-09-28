@@ -93,9 +93,26 @@ Window metadata is optional and additive:
   cap, or a model/bucket identifier.
 - `window_id`: the identity within that scope, such as `primary` or `secondary`.
 
+Percentage allowances show **used and left** together (for example, `87% used ·
+13% left`); bars fill according to the amount **left**. The collapsed row gives
+its period and percentages a full-width line, with the reset countdown below.
+Expanded rows keep a compact period/value line; exhausted rows retain the limit
+notice and show both percentages. Very small positive allowances use `<1% left`
+(and `>99% used`) rather than appearing exhausted.
+
+Periods come from source metadata, never the plan name or distance to reset.
+Explicit `Monthly` / `Current month` labels display as **Monthly**; `Calendar
+month` stays explicit. A fixed `2592000`-second window displays as **30d**, not a
+calendar month. Duration metadata takes precedence over legacy period labels.
+No monthly allowance is manufactured for a provider that reports only weekly or
+session limits. The current payload has no separate calendar/billing-period field;
+monthly support relies on an explicit source label, not a guessed billing cycle.
+
 The collapsed bar and summary refer to the same allowance. Expanded rows keep
 independent quotas separate. A depleted model/reserve bucket does not by itself
-mark the whole account exhausted. Credit balances remain amounts rather than
+mark the whole account exhausted. When Codex supplies an account allowance,
+independent reserve/model allowances stay text-only; a reserve-only payload can
+still show its own bar. Credit balances remain amounts rather than
 invented percentages, and unknown usage does not produce a full bar. Older
 payloads still work; missing duration is never inferred from time until reset.
 

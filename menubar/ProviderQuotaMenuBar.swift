@@ -1585,14 +1585,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // section container, not here.
         // When EXPANDED the header drops its second (summary) line — that info now
         // lives in the window rows below — so the header shrinks to a single centred
-        // line (26px vs 36px).
-        let rowH: CGFloat = expanded ? 26 : 36
+        // line (26px vs 50px).
+        let rowH: CGFloat = expanded ? 26 : 50
         let view = hoverRow(NSRect(x: 0, y: 0, width: 360, height: rowH), tint: providerBrandColor(provider), persistent: false)
         view.drawsBorder = false
         // One chevron that ROTATES between collapsed (▶) and expanded (▼) so the
         // icon change is a smooth spin, not a symbol swap. Layer-anchored at its
         // centre for the rotation.
-        let chevronY: CGFloat = expanded ? 7 : 12
+        let chevronY: CGFloat = expanded ? 7 : 19
         let chevron = NSImageView(frame: NSRect(x: 13, y: chevronY, width: 12, height: 12))
         chevron.image = NSImage(systemSymbolName: "chevron.right", accessibilityDescription: expanded ? "Collapse" : "Expand")
         chevron.contentTintColor = expanded ? providerBrandColor(provider) : menuTertiaryColor()
@@ -1617,14 +1617,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         view.hoverHandler = { [weak chevron] hovering in
             chevron?.contentTintColor = (hovering || expanded) ? brand : idle
         }
-        view.addSubview(label(provider.label, frame: NSRect(x: 70, y: expanded ? 5 : 17, width: 130, height: 16), font: .systemFont(ofSize: 12, weight: .semibold), color: providerBrandColor(provider)))
+        view.addSubview(label(provider.label, frame: NSRect(x: 70, y: expanded ? 5 : 31, width: 130, height: 16), font: .systemFont(ofSize: 12, weight: .semibold), color: providerBrandColor(provider)))
         if let plan = displayPlan(provider) {
-            view.addSubview(label(plan.uppercased(), frame: NSRect(x: 196, y: expanded ? 6 : 18, width: 94, height: 14), font: .systemFont(ofSize: 8.5, weight: .medium), color: menuTertiaryColor(), alignment: .right))
+            view.addSubview(label(plan.uppercased(), frame: NSRect(x: 196, y: expanded ? 6 : 32, width: 94, height: 14), font: .systemFont(ofSize: 8.5, weight: .medium), color: menuTertiaryColor(), alignment: .right))
         }
         // A provider that just RESET swaps its status dot for a green reset icon and
         // leads its summary with "Quota back" for a few seconds (the pet waves too).
         let recovered = providerRecentlyRecovered(key)
-        let statusImage = NSImageView(frame: NSRect(x: recovered ? 322 : 323, y: expanded ? 7 : (recovered ? 17 : 18), width: recovered ? 15 : 12, height: recovered ? 15 : 12))
+        let statusImage = NSImageView(frame: NSRect(x: recovered ? 322 : 323, y: expanded ? 7 : (recovered ? 31 : 32), width: recovered ? 15 : 12, height: recovered ? 15 : 12))
         if recovered {
             statusImage.image = NSImage(systemSymbolName: "arrow.clockwise.circle.fill", accessibilityDescription: "Quota reset — available again")
             statusImage.contentTintColor = .hermesGreen
@@ -1633,25 +1633,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             statusImage.image = providerDotImage(provider, size: 14, connected: connected)
         }
         view.addSubview(statusImage)
-        // Brief line: summary text + an overall provider-coloured bar. On a just-RESET
-        // provider the green reset icon (above) is the recovery cue — the summary stays
-        // NORMAL wording (no "Quota back ·" prefix, which was long enough to overrun the
-        // bar) so it reads cleanly next to the restored bar, tinted green only while the
-        // celebration lasts. When a bar WILL show, the summary is narrow so it can't
-        // collide with it; an out-of-quota row (no bar) gets the full width for its
-        // longer "Resets in … · over limit" text.
-        let summaryText = providerSummary(provider, connected: connected)
+        // Period and used/left percentages get their own full-width line. The
+        // selected allowance's reset sits below, beside its remaining-quota bar.
+        // Recovery is conveyed by the icon and colour, not an extra text prefix.
+        let summaryText = providerSummary(provider, connected: connected, includeReset: false)
         // Bar shows only for a connected, in-quota provider with a collapsed % — an
-        // out-of-quota row draws NO bar (a 0%-full bar is just noise) and gives the
-        // summary the full width for its longer "Resets … · over limit" text. When
+        // out-of-quota row draws NO bar (a 0%-full bar is just noise). When
         // EXPANDED, the per-window rows below already show the bar + numbers, so the
         // header drops its own summary line AND bar to avoid a doubled usage graph —
         // it keeps only the single name line.
         let barWillShow = !expanded && connected && provider.status == "ok" && !providerIsExhausted(provider)
             && collapsedRemainingPercent(provider) != nil
-        let summaryWidth: CGFloat = barWillShow ? 156 : 250
+        let summaryWidth: CGFloat = 266
         if !expanded {
-            view.addSubview(label(summaryText, frame: NSRect(x: 70, y: 2, width: summaryWidth, height: 14), font: .systemFont(ofSize: 9.5), color: recovered ? .hermesGreen : menuSecondaryColor()))
+            view.addSubview(label(summaryText, frame: NSRect(x: 70, y: 17, width: summaryWidth, height: 14), font: .systemFont(ofSize: 9.5), color: recovered ? .hermesGreen : menuSecondaryColor()))
+        }
+        if !expanded && connected && provider.status == "ok", let window = collapsedWindow(provider) {
+            let reset = preciseCountdown(window.resetsAt).map { "Resets in \($0)" }
+                ?? "No reset time reported"
+            view.addSubview(label(reset, frame: NSRect(x: 70, y: 2, width: barWillShow ? 156 : 266, height: 14), font: .systemFont(ofSize: 9.5), color: menuSecondaryColor()))
         }
         if barWillShow, let minimum = collapsedRemainingPercent(provider) {
             let track = NSView(frame: NSRect(x: 232, y: 6, width: 104, height: 5))
@@ -1679,7 +1679,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // against the title + subtitle block. Added AFTER the full-row expand button
         // so it stays independently clickable on top of it.
         let shown = providerShownInMenuBar(kind, provider.provider)
-        let eye = NSButton(frame: NSRect(x: 46, y: expanded ? 4 : 9, width: 18, height: 18))
+        let eye = NSButton(frame: NSRect(x: 46, y: expanded ? 4 : 16, width: 18, height: 18))
         eye.isBordered = false
         eye.title = ""
         eye.image = NSImage(systemSymbolName: shown ? "eye" : "eye.slash",
@@ -1851,6 +1851,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         provider.windows
     }
 
+    private func windowShowsBar(_ window: QuotaWindow, provider: QuotaProvider) -> Bool {
+        guard window.remainingAmount == nil, window.remainingPercent != nil else { return false }
+        if Self.normalizedProvider(provider.provider) == "openai-codex",
+           let scope = window.scope, !scope.isEmpty, !["account", "api-key"].contains(scope),
+           !applicableWindows(provider).isEmpty {
+            return false
+        }
+        return true
+    }
+
     private func collapsedWindow(_ provider: QuotaProvider) -> QuotaWindow? {
         let account = applicableWindows(provider)
         let candidates = account.isEmpty ? provider.windows : account
@@ -1868,15 +1878,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func quotaPercentText(_ percent: Double) -> String {
-        percent > 0 && percent < 1 ? "<1% left" : "\(Int(percent.rounded()))% left"
+        guard percent.isFinite else { return "Usage unavailable" }
+        let remaining = max(0, min(100, percent))
+        func part(_ value: Double) -> String {
+            if value > 0 && value < 1 { return "<1%" }
+            if value > 99 && value < 100 { return ">99%" }
+            return "\(Int(value.rounded()))%"
+        }
+        return "\(part(100 - remaining)) used · \(part(remaining)) left"
     }
 
     private func windowLabel(_ window: QuotaWindow, provider: QuotaProvider) -> String {
-        let generic = ["session", "current session", "weekly", "current week", "week", "primary", "secondary"]
+        let generic = ["session", "current session", "weekly", "current week", "week", "monthly", "current month", "calendar month", "primary", "secondary"]
         var label = window.label
         var bucket: String?
         if !generic.contains(label.lowercased()), (window.windowSeconds ?? 0) > 0 || Self.normalizedProvider(provider.provider) == "openai-codex" {
-            for suffix in ["current session", "current week", "session", "weekly", "week", "primary", "secondary"] {
+            for suffix in ["current session", "current week", "current month", "calendar month", "session", "weekly", "week", "monthly", "primary", "secondary"] {
                 if label.lowercased().hasSuffix(" " + suffix) {
                     bucket = String(label.dropLast(suffix.count)).trimmingCharacters(in: CharacterSet(charactersIn: " ·"))
                     label = String(label.suffix(suffix.count))
@@ -1901,6 +1918,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let durationOnly = raw.range(of: #"^\d+(\.\d+)?[dhms]( quota)?$"#, options: .regularExpression) != nil
             label = generic.contains(raw) || generic.contains(raw.replacingOccurrences(of: " quota", with: "")) || durationOnly
                 ? duration : "\(label) (\(duration))"
+        } else if ["monthly", "current month"].contains(raw) {
+            label = "Monthly"
         } else if Self.normalizedProvider(provider.provider) == "openai-codex" {
             for (suffix, neutral) in [("current session", "Primary"), ("session", "Primary"), ("current week", "Secondary"), ("weekly", "Secondary")] {
                 if raw == suffix {
@@ -1926,7 +1945,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func applicableWindows(_ provider: QuotaProvider) -> [QuotaWindow] {
         provider.windows.filter { window in
             if let scope = window.scope { return ["account", "api-key"].contains(scope) }
-            return ["session", "current session", "weekly", "current week", "account credits", "api key limit", "api key quota"].contains(window.label.lowercased())
+            return ["session", "current session", "weekly", "current week", "monthly", "current month", "calendar month", "account credits", "api key limit", "api key quota"].contains(window.label.lowercased())
         }
     }
 
@@ -2138,7 +2157,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
 
-    private func providerSummary(_ provider: QuotaProvider, connected: Bool) -> String {
+    private func providerSummary(_ provider: QuotaProvider, connected: Bool, includeReset: Bool = true) -> String {
         guard connected else { return "Disconnected · sign in" }
         guard provider.status == "ok" else {
             return provider.status.replacingOccurrences(of: "_", with: " ").capitalized
@@ -2155,7 +2174,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             value = "Usage unavailable"
         }
         let base = "\(windowLabel(window, provider: provider)) · \(value)"
-        if let reset = preciseCountdown(window.resetsAt) {
+        if includeReset, let reset = preciseCountdown(window.resetsAt) {
             return "\(base) · resets in \(reset)"
         }
         return base
@@ -2248,14 +2267,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             view.addSubview(label(displayValue, frame: NSRect(x: 190, y: 35, width: 150, height: 17), font: .monospacedDigitSystemFont(ofSize: 12, weight: .semibold), color: valueColor, alignment: .right))
             let resetLine = preciseCountdown(window.resetsAt).map { "Resets in \($0)" } ?? "No reset time reported"
             view.addSubview(label(resetLine, frame: NSRect(x: 28, y: 19, width: 312, height: 15), font: .systemFont(ofSize: 11, weight: .medium), color: menuPrimaryColor()))
+            if window.remainingAmount == nil, let percent = window.remainingPercent {
+                view.addSubview(label(quotaPercentText(percent), frame: NSRect(x: 28, y: 3, width: 312, height: 14), font: .monospacedDigitSystemFont(ofSize: 10, weight: .medium), color: valueColor))
+            }
             return view
         }
 
         // In-quota: compact row — label + value, a thin bar, and a subtitle.
         let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 42))
-        view.addSubview(label(windowLabel(window, provider: provider), frame: NSRect(x: 28, y: 25, width: 170, height: 15), font: .systemFont(ofSize: 11, weight: .medium)))
-        view.addSubview(label(displayValue, frame: NSRect(x: 190, y: 24, width: 150, height: 16), font: .monospacedDigitSystemFont(ofSize: 11, weight: .semibold), color: valueColor, alignment: .right))
-        if window.remainingAmount == nil, window.remainingPercent != nil {
+        view.addSubview(label(windowLabel(window, provider: provider), frame: NSRect(x: 28, y: 25, width: 140, height: 15), font: .systemFont(ofSize: 11, weight: .medium)))
+        view.addSubview(label(displayValue, frame: NSRect(x: 174, y: 24, width: 166, height: 16), font: .monospacedDigitSystemFont(ofSize: 11, weight: .semibold), color: valueColor, alignment: .right))
+        if windowShowsBar(window, provider: provider) {
             let track = NSView(frame: NSRect(x: 28, y: 15, width: 312, height: 5))
             track.wantsLayer = true
             track.layer?.cornerRadius = 2.5
