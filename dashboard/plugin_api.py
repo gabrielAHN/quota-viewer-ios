@@ -164,9 +164,17 @@ def _refresh_official_cache() -> None:
     env = dict(os.environ)
     env["HERMES_HOME"] = str(_hermes_home())
     code = (
-        "import sys; sys.path.insert(0, %r); "
-        "from quota.quota_cache import refresh_quota_cache; refresh_quota_cache()"
-    ) % str(root.parent)
+        "import sys; sys.path.insert(0, %r); sys.path.insert(0, %r)\n"
+        "from pathlib import Path; import hermes_constants\n"
+        "sys.path.insert(0, str(Path(hermes_constants.__file__).resolve().parent))\n"
+        "from quota.quota_cache import refresh_quota_cache\n"
+        "try:\n"
+        "    from quota_metadata_compat import install\n"
+        "    install()\n"
+        "except Exception:\n"
+        "    pass\n"
+        "refresh_quota_cache()\n"
+    ) % (str(root.parent), str(Path(__file__).resolve().parent))
     try:
         subprocess.run(
             [python, "-c", code],
@@ -193,6 +201,7 @@ def _adapt_record(slug: str, label: str, rec: dict[str, Any], fetched_at: str | 
             "resets_at": w.get("reset_at"),
             "detail": None,
             "warning": used is not None and used >= 85.0,
+            **{key: w[key] for key in ("window_seconds", "scope", "window_id") if key in w},
         })
     details = [str(d) for d in (rec.get("details") or [])]
     if slug == "openrouter":

@@ -207,7 +207,7 @@ def _antigravity_windows(payload):
         buckets = group.get("buckets")
         if not isinstance(buckets, list):
             continue
-        for bucket in buckets:
+        for index, bucket in enumerate(buckets):
             if not isinstance(bucket, dict):
                 continue
             disabled = bucket.get("disabled")
@@ -216,11 +216,13 @@ def _antigravity_windows(payload):
             fraction = _antigravity_fraction(bucket)
             if fraction is None:
                 continue
-            identity = " ".join(str(bucket.get(key) or "") for key in ("bucketId", "id", "displayName", "name", "window")).lower()
-            period = "Weekly" if "week" in identity or "7d" in identity or "seven" in identity else "Session" if "session" in identity or "hour" in identity or "5" in identity else str(bucket.get("displayName") or bucket.get("name") or "Quota").strip()
+            identity = next((str(bucket[key]) for key in ("bucketId", "id", "displayName", "name", "window") if bucket.get(key)), f"bucket:{index}")
+            period = str(bucket.get("displayName") or bucket.get("name") or bucket.get("window") or "Quota").strip()
             reset = next((bucket.get(key) for key in ("resetTime", "reset_time", "resetAt", "reset_at") if bucket.get(key)), None)
             remaining = fraction * 100.0
-            windows.append(_window(f"{family} {period.lower()}", 100.0 - remaining, resets_at=reset, detail=f"{remaining:.0f}% left"))
+            result = _window(f"{family} {period.lower()}", 100.0 - remaining, resets_at=reset, detail=f"{remaining:.0f}% left")
+            result.update(scope=f"model-family:{family.lower()}", window_id=identity)
+            windows.append(result)
     return windows
 
 
@@ -308,11 +310,11 @@ def anthropic_provider():
     except Exception as exc:
         return _provider("anthropic", "Claude", "unavailable", [], message=f"Could not reach Claude usage: {exc}")
     windows = []
-    for key, wlabel in (
-        ("five_hour", "Current session"),
-        ("seven_day", "Current week"),
-        ("seven_day_opus", "Opus week"),
-        ("seven_day_sonnet", "Sonnet week"),
+    for key, wlabel, scope, seconds in (
+        ("five_hour", "Current session", "account", 18000),
+        ("seven_day", "Current week", "account", 604800),
+        ("seven_day_opus", "Opus week", "opus", 604800),
+        ("seven_day_sonnet", "Sonnet week", "sonnet", 604800),
     ):
         window = payload.get(key) or {}
         util = window.get("utilization")
@@ -323,7 +325,9 @@ def anthropic_provider():
         # multiply by 100" fraction guess inverted a barely-used window into a full
         # one — a fresh session at 1% utilization became 100% used → "no quota".
         used = max(0.0, min(100.0, float(util)))
-        windows.append(_window(wlabel, used, resets_at=window.get("resets_at")))
+        result = _window(wlabel, used, resets_at=window.get("resets_at"))
+        result.update(window_seconds=seconds, scope=scope, window_id=key)
+        windows.append(result)
     details = []
     extra = payload.get("extra_usage") or {}
     if extra.get("is_enabled"):
@@ -367,6 +371,72 @@ def _codex_creds():
     return candidates[0][1], candidates[0][2]
 
 
+def _codex_windows(rate_limit, scope="account", prefix=None):
+    windows = []
+    if not isinstance(rate_limit, dict):
+        return windows
+    for key in ("primary_window", "secondary_window"):
+        window = rate_limit.get(key)
+        if not isinstance(window, dict):
+            continue
+        try:
+            used = float(window.get("used_percent"))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not -float("inf") < used < float("inf"):
+            continue
+        window_seconds = window.get("limit_window_seconds")
+        if isinstance(window_seconds, bool) or not isinstance(window_seconds, (int, float)):
+            window_seconds = None
+        else:
+            try:
+                window_seconds = float(window_seconds)
+            except OverflowError:
+                window_seconds = None
+        if window_seconds is not None and not 0 < window_seconds < float("inf"):
+            window_seconds = None
+        if window_seconds == 18000:
+            wlabel = "Session"
+        elif window_seconds == 604800:
+            wlabel = "Weekly"
+        elif window_seconds is None:
+            wlabel = key.removesuffix("_window").title() + " quota"
+        else:
+            unit, divisor = next(((unit, divisor) for unit, divisor in
+                                  (("d", 86400), ("h", 3600), ("m", 60))
+                                  if window_seconds % divisor == 0 and
+                                  (unit != "d" or window_seconds > 86400)), ("s", 1))
+            wlabel = f"{window_seconds / divisor:g}{unit} quota"
+        # `reset_at` is a Unix timestamp (Hermes reports an ISO instant, so convert
+        # to match); also accept an ISO string, or derive from reset_after_seconds.
+        reset_at = window.get("reset_at")
+        resets_iso = None
+        if isinstance(reset_at, bool):
+            pass
+        elif isinstance(reset_at, (int, float)) and 0 < reset_at < float("inf"):
+            try:
+                resets_iso = datetime.fromtimestamp(reset_at, timezone.utc).isoformat()
+            except (OverflowError, ValueError, OSError):
+                resets_iso = None
+        elif isinstance(reset_at, str) and reset_at:
+            try:
+                resets_iso = datetime.fromisoformat(reset_at.replace("Z", "+00:00")).isoformat()
+            except Exception:
+                resets_iso = None
+        if resets_iso is None:
+            after = window.get("reset_after_seconds")
+            if (not isinstance(after, bool) and isinstance(after, (int, float))
+                    and 0 < after < float("inf")):
+                try:
+                    resets_iso = (datetime.now(timezone.utc) + timedelta(seconds=after)).isoformat()
+                except (OverflowError, ValueError):
+                    resets_iso = None
+        result = _window(f"{prefix} {wlabel}" if prefix else wlabel, used, resets_at=resets_iso)
+        result.update(window_seconds=window_seconds, scope=scope, window_id=key.removesuffix("_window"))
+        windows.append(result)
+    return windows
+
+
 def codex_provider():
     creds = _codex_creds()
     if not creds:
@@ -384,45 +454,16 @@ def codex_provider():
         return _provider("openai-codex", "Codex", "unavailable", [], message=f"Codex usage error (HTTP {exc.code}).")
     except Exception as exc:
         return _provider("openai-codex", "Codex", "unavailable", [], message=f"Could not reach Codex usage: {exc}")
-    rate_limit = payload.get("rate_limit") or {}
-    windows = []
-    for key in ("primary_window", "secondary_window"):
-        window = rate_limit.get(key) or {}
-        used = window.get("used_percent")
-        if used is None:
+    windows = _codex_windows(payload.get("rate_limit") or {})
+    additional = payload.get("additional_rate_limits")
+    if not isinstance(additional, list):
+        additional = []
+    for index, extra in enumerate(additional):
+        if not isinstance(extra, dict):
             continue
-        # Label by the window's own length when the API gives it (18000s ≈ the ~5h
-        # session, 604800s = the weekly allowance); fall back to key/reset distance.
-        window_seconds = window.get("limit_window_seconds")
-        if isinstance(window_seconds, (int, float)):
-            wlabel = "Weekly" if window_seconds > 2 * 86400 else "Session"
-        else:
-            wlabel = "Session" if key == "primary_window" else "Weekly"
-        # `reset_at` is a Unix timestamp (Hermes reports an ISO instant, so convert
-        # to match); also accept an ISO string, or derive from reset_after_seconds.
-        reset_at = window.get("reset_at")
-        resets_iso = None
-        if isinstance(reset_at, bool):
-            pass
-        elif isinstance(reset_at, (int, float)) and reset_at > 0:
-            resets_iso = datetime.fromtimestamp(reset_at, timezone.utc).isoformat()
-        elif isinstance(reset_at, str) and reset_at:
-            try:
-                resets_iso = datetime.fromisoformat(reset_at.replace("Z", "+00:00")).isoformat()
-            except Exception:
-                resets_iso = None
-        if resets_iso is None:
-            after = window.get("reset_after_seconds")
-            if isinstance(after, (int, float)) and after > 0:
-                resets_iso = (datetime.now(timezone.utc) + timedelta(seconds=after)).isoformat()
-        # A reset distance still lets us label the window even without limit length.
-        if not isinstance(window_seconds, (int, float)) and resets_iso:
-            try:
-                secs = (datetime.fromisoformat(resets_iso) - datetime.now(timezone.utc)).total_seconds()
-                wlabel = "Weekly" if secs > 2 * 86400 else "Session"
-            except Exception:
-                pass
-        windows.append(_window(wlabel, used, resets_at=resets_iso))
+        scope = str(extra.get("metered_feature") or extra.get("limit_name") or f"additional:{index}")
+        prefix = str(extra.get("limit_name") or extra.get("metered_feature") or f"Additional {index + 1}")
+        windows.extend(_codex_windows(extra.get("rate_limit") or {}, scope, prefix))
     details = []
     reset_credits = payload.get("rate_limit_reset_credits") or {}
     banked = reset_credits.get("available_count")
@@ -491,6 +532,8 @@ def _openrouter_credits_provider(slug, label, key, source, reject_message):
                                    detail=f"${max(0.0, klimit - kusage):.2f} of ${klimit:.2f} key limit left"))
     except Exception:
         pass
+    for window, window_id in zip(windows, ("account_credits", "api_key_limit")):
+        window.update(scope="account" if window_id == "account_credits" else "api-key", window_id=window_id)
     return _provider(slug, label, "ok", windows, source=source)
 
 
