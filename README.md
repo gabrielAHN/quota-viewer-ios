@@ -79,6 +79,33 @@ On a Hermes **gateway host**, install the plugin with `./install.sh` (then
 - **Both sources at once** — no fallback; a disconnected source's providers still
   list as **Disconnected**.
 
+## Plan-aware quota windows
+
+Bars represent individual API-reported allowances, not a fixed quota inferred
+from the subscription name. Codex Pro, Pro (More), and Pro (Max) share the same
+data-driven rendering; a weekly-only plan does not acquire a fictional five-hour
+session window.
+
+Window metadata is optional and additive:
+
+- `window_seconds`: the allowance duration, separate from its reset timestamp.
+- `scope`: `account` for an account-wide limit, `api-key` for the selected key's
+  cap, or a model/bucket identifier.
+- `window_id`: the identity within that scope, such as `primary` or `secondary`.
+
+The collapsed bar and summary refer to the same allowance. Expanded rows keep
+independent quotas separate. A depleted model/reserve bucket does not by itself
+mark the whole account exhausted. Credit balances remain amounts rather than
+invented percentages, and unknown usage does not produce a full bar. Older
+payloads still work; missing duration is never inferred from time until reset.
+
+For Hermes sources, update the gateway plugin as well as the Mac app. The gateway
+compatibility helper preserves Codex duration and scope during the existing
+quota-cache refresh, without extra usage requests or changes to authentication.
+It runs only inside the fresh refresh subprocess, not as a permanent upstream
+plugin modification. Refreshes initiated outside this gateway plugin may still
+produce older metadata-free records; those receive the legacy display fallback.
+
 ## Configuring providers (gateway)
 
 The plugin reports a configurable set via `PROVIDER_QUOTA_PROVIDERS`
