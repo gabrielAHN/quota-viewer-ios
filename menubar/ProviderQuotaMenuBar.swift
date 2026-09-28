@@ -1930,7 +1930,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // (organizationType / rate-limit tier from ~/.claude.json) so a Team/Max/Pro
     // subscription shows even when the gateway payload carries no plan.
     private func displayPlan(_ provider: QuotaProvider) -> String? {
-        if let plan = provider.plan, !plan.isEmpty { return plan }
+        if let plan = provider.plan, !plan.isEmpty {
+            if Self.normalizedProvider(provider.provider) == "openai-codex" {
+                switch plan.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+                case "prolite": return "Pro"
+                case "pro": return "Pro (More)"
+                case "promax": return "Pro (Max)"
+                default: break
+                }
+            }
+            return plan
+        }
         if Self.normalizedProvider(provider.provider) == "anthropic" {
             return Self.claudeSubscriptionLabel
         }
