@@ -23,11 +23,7 @@ struct QuotaProvider: Codable {
 }
 
 struct QuotaWindow: Codable {
-    // "Limit reached" = the window is genuinely OUT (you can't use it) → red /
-    // exhausted. A low-but-usable window (e.g. 4% weekly left) is NOT "reached" — it
-    // still has quota; it reads as low (orange, ≤15%) instead. Previously this was 5%,
-    // which flagged a still-usable 4% as "no quota".
-    private static let limitReachedRemainingPercent = 0.5
+    private static let limitReachedRemainingPercent = 0.0
 
     let label: String
     let remainingPercent: Double?
@@ -36,6 +32,9 @@ struct QuotaWindow: Codable {
     let resetsAt: String?
     let detail: String?
     let warning: Bool
+    var windowSeconds: Double? = nil
+    var scope: String? = nil
+    var windowId: String? = nil
 
     var limitReached: Bool {
         Self.reachesLimit(remainingPercent: remainingPercent, remainingAmount: remainingAmount)
@@ -54,6 +53,9 @@ struct QuotaWindow: Codable {
         case resetsAt = "resets_at"
         case detail
         case warning
+        case windowSeconds = "window_seconds"
+        case scope
+        case windowId = "window_id"
     }
 }
 
@@ -1583,14 +1585,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // section container, not here.
         // When EXPANDED the header drops its second (summary) line — that info now
         // lives in the window rows below — so the header shrinks to a single centred
-        // line (26px vs 36px).
-        let rowH: CGFloat = expanded ? 26 : 36
+        // line (26px vs 50px).
+        let rowH: CGFloat = expanded ? 26 : 50
         let view = hoverRow(NSRect(x: 0, y: 0, width: 360, height: rowH), tint: providerBrandColor(provider), persistent: false)
         view.drawsBorder = false
         // One chevron that ROTATES between collapsed (▶) and expanded (▼) so the
         // icon change is a smooth spin, not a symbol swap. Layer-anchored at its
         // centre for the rotation.
-        let chevronY: CGFloat = expanded ? 7 : 12
+        let chevronY: CGFloat = expanded ? 7 : 19
         let chevron = NSImageView(frame: NSRect(x: 13, y: chevronY, width: 12, height: 12))
         chevron.image = NSImage(systemSymbolName: "chevron.right", accessibilityDescription: expanded ? "Collapse" : "Expand")
         chevron.contentTintColor = expanded ? providerBrandColor(provider) : menuTertiaryColor()
@@ -1615,14 +1617,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         view.hoverHandler = { [weak chevron] hovering in
             chevron?.contentTintColor = (hovering || expanded) ? brand : idle
         }
-        view.addSubview(label(provider.label, frame: NSRect(x: 70, y: expanded ? 5 : 17, width: 130, height: 16), font: .systemFont(ofSize: 12, weight: .semibold), color: providerBrandColor(provider)))
+        view.addSubview(label(provider.label, frame: NSRect(x: 70, y: expanded ? 5 : 31, width: 130, height: 16), font: .systemFont(ofSize: 12, weight: .semibold), color: providerBrandColor(provider)))
         if let plan = displayPlan(provider) {
-            view.addSubview(label(plan.uppercased(), frame: NSRect(x: 196, y: expanded ? 6 : 18, width: 94, height: 14), font: .systemFont(ofSize: 8.5, weight: .medium), color: menuTertiaryColor(), alignment: .right))
+            view.addSubview(label(plan.uppercased(), frame: NSRect(x: 196, y: expanded ? 6 : 32, width: 94, height: 14), font: .systemFont(ofSize: 8.5, weight: .medium), color: menuTertiaryColor(), alignment: .right))
         }
         // A provider that just RESET swaps its status dot for a green reset icon and
         // leads its summary with "Quota back" for a few seconds (the pet waves too).
         let recovered = providerRecentlyRecovered(key)
-        let statusImage = NSImageView(frame: NSRect(x: recovered ? 322 : 323, y: expanded ? 7 : (recovered ? 17 : 18), width: recovered ? 15 : 12, height: recovered ? 15 : 12))
+        let statusImage = NSImageView(frame: NSRect(x: recovered ? 322 : 323, y: expanded ? 7 : (recovered ? 31 : 32), width: recovered ? 15 : 12, height: recovered ? 15 : 12))
         if recovered {
             statusImage.image = NSImage(systemSymbolName: "arrow.clockwise.circle.fill", accessibilityDescription: "Quota reset — available again")
             statusImage.contentTintColor = .hermesGreen
@@ -1631,29 +1633,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             statusImage.image = providerDotImage(provider, size: 14, connected: connected)
         }
         view.addSubview(statusImage)
-        // Brief line: summary text + an overall provider-coloured bar. On a just-RESET
-        // provider the green reset icon (above) is the recovery cue — the summary stays
-        // NORMAL wording (no "Quota back ·" prefix, which was long enough to overrun the
-        // bar) so it reads cleanly next to the restored bar, tinted green only while the
-        // celebration lasts. When a bar WILL show, the summary is narrow so it can't
-        // collide with it; an out-of-quota row (no bar) gets the full width for its
-        // longer "Resets in … · over limit" text.
-        let summaryText = providerSummary(provider, connected: connected)
+        // Period and used/left percentages get their own full-width line. The
+        // selected allowance's reset sits below, beside its remaining-quota bar.
+        // Recovery is conveyed by the icon and colour, not an extra text prefix.
+        let summaryText = providerSummary(provider, connected: connected, includeReset: false)
         // Bar shows only for a connected, in-quota provider with a collapsed % — an
-        // out-of-quota row draws NO bar (a 0%-full bar is just noise) and gives the
-        // summary the full width for its longer "Resets … · over limit" text. When
+        // out-of-quota row draws NO bar (a 0%-full bar is just noise). When
         // EXPANDED, the per-window rows below already show the bar + numbers, so the
         // header drops its own summary line AND bar to avoid a doubled usage graph —
         // it keeps only the single name line.
         let barWillShow = !expanded && connected && provider.status == "ok" && !providerIsExhausted(provider)
             && collapsedRemainingPercent(provider) != nil
-        let summaryWidth: CGFloat = barWillShow ? 156 : 250
+        let summaryWidth: CGFloat = 266
         if !expanded {
-            view.addSubview(label(summaryText, frame: NSRect(x: 70, y: 2, width: summaryWidth, height: 14), font: .systemFont(ofSize: 9.5), color: recovered ? .hermesGreen : menuSecondaryColor()))
+            view.addSubview(label(summaryText, frame: NSRect(x: 70, y: 17, width: summaryWidth, height: 14), font: .systemFont(ofSize: 9.5), color: recovered ? .hermesGreen : menuSecondaryColor()))
         }
-        // Bar tracks the collapsed %: the current-session window for %-based
-        // providers (Codex/Claude); amount-only providers (OpenRouter) keep their
-        // existing bar via the min fallback.
+        if !expanded && connected && provider.status == "ok", let window = collapsedWindow(provider) {
+            let reset = preciseCountdown(window.resetsAt).map { "Resets in \($0)" }
+                ?? "No reset time reported"
+            view.addSubview(label(reset, frame: NSRect(x: 70, y: 2, width: barWillShow ? 156 : 266, height: 14), font: .systemFont(ofSize: 9.5), color: menuSecondaryColor()))
+        }
         if barWillShow, let minimum = collapsedRemainingPercent(provider) {
             let track = NSView(frame: NSRect(x: 232, y: 6, width: 104, height: 5))
             track.wantsLayer = true
@@ -1680,7 +1679,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // against the title + subtitle block. Added AFTER the full-row expand button
         // so it stays independently clickable on top of it.
         let shown = providerShownInMenuBar(kind, provider.provider)
-        let eye = NSButton(frame: NSRect(x: 46, y: expanded ? 4 : 9, width: 18, height: 18))
+        let eye = NSButton(frame: NSRect(x: 46, y: expanded ? 4 : 16, width: 18, height: 18))
         eye.isBordered = false
         eye.title = ""
         eye.image = NSImage(systemSymbolName: shown ? "eye" : "eye.slash",
@@ -1848,75 +1847,112 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
 
-    private func providerMinimum(_ provider: QuotaProvider) -> Double? {
-        provider.windows.compactMap(\.remainingPercent).min()
-    }
-
-    // The "current session" window — the short (~5h) window whose remaining % the
-    // COLLAPSED provider row shows (not the min across windows, which could be the
-    // weekly/total). Identify it by a "session" label (Codex "Session", Claude
-    // "Current session"), else the soonest-resetting window (a session resets
-    // before the weekly), else the only window.
-    private func sessionWindow(_ provider: QuotaProvider) -> QuotaWindow? {
-        if let s = provider.windows.first(where: { $0.label.lowercased().contains("session") }) {
-            return s
-        }
-        let dated = provider.windows.compactMap { w -> (QuotaWindow, Date)? in
-            parsedDate(w.resetsAt).map { (w, $0) }
-        }
-        if let soonest = dated.min(by: { $0.1 < $1.1 })?.0 {
-            return soonest
-        }
-        return provider.windows.first
-    }
-
-    // The weekly window — Claude's "Current week" / Codex's "Weekly". The longer
-    // window that ultimately gates usage once a session is spent.
-    private func weeklyWindow(_ provider: QuotaProvider) -> QuotaWindow? {
-        provider.windows.first { $0.label.lowercased().contains("week") }
-    }
-
-    // Whether the session window should be HIDDEN for this provider. Rule: hide
-    // the session ONLY when the WEEKLY is over limit — then the session is moot
-    // until the weekly resets, so show the weekly alone. When the SESSION is the
-    // one that's capped but the weekly still has room, KEEP the session: its reset
-    // time is exactly what you're waiting for to get unblocked (e.g. a spent Codex
-    // 5h window that resets in a couple of hours while the weekly is fine).
-    private func hideSessionWindow(_ provider: QuotaProvider) -> Bool {
-        guard weeklyWindow(provider) != nil else { return false }
-        return weeklyWindow(provider)?.limitReached ?? false
-    }
-
-    // The windows to actually display for a provider, after applying the
-    // session/weekly over-limit suppression. Non-session/weekly windows (e.g. the
-    // per-model Opus/Sonnet weeks) are always kept.
     private func displayWindows(_ provider: QuotaProvider) -> [QuotaWindow] {
-        guard hideSessionWindow(provider), let session = sessionWindow(provider) else {
-            return provider.windows
-        }
-        return provider.windows.filter { $0.label != session.label }
+        provider.windows
     }
 
-    // Remaining % of the current-session window (nil for amount-only providers
-    // like OpenRouter, whose collapsed row shows a $ amount instead).
-    private func sessionRemainingPercent(_ provider: QuotaProvider) -> Double? {
-        sessionWindow(provider)?.remainingPercent
+    private func windowShowsBar(_ window: QuotaWindow, provider: QuotaProvider) -> Bool {
+        guard window.remainingAmount == nil, window.remainingPercent != nil else { return false }
+        if Self.normalizedProvider(provider.provider) == "openai-codex",
+           let scope = window.scope, !scope.isEmpty, !["account", "api-key"].contains(scope),
+           !applicableWindows(provider).isEmpty {
+            return false
+        }
+        return true
+    }
+
+    private func collapsedWindow(_ provider: QuotaProvider) -> QuotaWindow? {
+        let account = applicableWindows(provider)
+        let candidates = account.isEmpty ? provider.windows : account
+        if let exhausted = candidates.first(where: \.limitReached) { return exhausted }
+        if let primary = candidates.first(where: { $0.windowId == "primary" }) { return primary }
+        if let shortest = candidates.filter({ ($0.windowSeconds ?? 0) > 0 }).min(by: { $0.windowSeconds! < $1.windowSeconds! }) {
+            return shortest
+        }
+        return candidates.first(where: { ["session", "current session"].contains($0.label.lowercased()) }) ?? candidates.first
     }
 
     private func collapsedRemainingPercent(_ provider: QuotaProvider) -> Double? {
-        // When the session is suppressed (session or weekly over limit), the
-        // collapsed bar tracks the WEEKLY window — the number that now matters —
-        // instead of the spent session's 0%.
-        if hideSessionWindow(provider), let weekly = weeklyWindow(provider)?.remainingPercent {
-            return weekly
+        guard let window = collapsedWindow(provider), window.remainingAmount == nil else { return nil }
+        return window.remainingPercent
+    }
+
+    private func quotaPercentText(_ percent: Double) -> String {
+        guard percent.isFinite else { return "Usage unavailable" }
+        let remaining = max(0, min(100, percent))
+        func part(_ value: Double) -> String {
+            if value > 0 && value < 1 { return "<1%" }
+            if value > 99 && value < 100 { return ">99%" }
+            return "\(Int(value.rounded()))%"
         }
-        return provider.windows.filter(\.limitReached).compactMap(\.remainingPercent).min()
-            ?? sessionRemainingPercent(provider)
-            ?? providerMinimum(provider)
+        return "\(part(100 - remaining)) used · \(part(remaining)) left"
+    }
+
+    private func windowLabel(_ window: QuotaWindow, provider: QuotaProvider) -> String {
+        let generic = ["session", "current session", "weekly", "current week", "week", "monthly", "current month", "calendar month", "primary", "secondary"]
+        var label = window.label
+        var bucket: String?
+        if !generic.contains(label.lowercased()), (window.windowSeconds ?? 0) > 0 || Self.normalizedProvider(provider.provider) == "openai-codex" {
+            for suffix in ["current session", "current week", "current month", "calendar month", "session", "weekly", "week", "monthly", "primary", "secondary"] {
+                if label.lowercased().hasSuffix(" " + suffix) {
+                    bucket = String(label.dropLast(suffix.count)).trimmingCharacters(in: CharacterSet(charactersIn: " ·"))
+                    label = String(label.suffix(suffix.count))
+                    break
+                }
+            }
+        }
+        let raw = label.lowercased()
+        if let seconds = window.windowSeconds, seconds.isFinite, seconds > 0 {
+            let duration: String
+            if seconds == 604800 {
+                duration = "Weekly"
+            } else if seconds.truncatingRemainder(dividingBy: 86400) == 0 {
+                duration = String(format: "%gd", seconds / 86400)
+            } else if seconds.truncatingRemainder(dividingBy: 3600) == 0 {
+                duration = String(format: "%gh", seconds / 3600)
+            } else if seconds.truncatingRemainder(dividingBy: 60) == 0 {
+                duration = String(format: "%gm", seconds / 60)
+            } else {
+                duration = String(format: "%gs", seconds)
+            }
+            let durationOnly = raw.range(of: #"^\d+(\.\d+)?[dhms]( quota)?$"#, options: .regularExpression) != nil
+            label = generic.contains(raw) || generic.contains(raw.replacingOccurrences(of: " quota", with: "")) || durationOnly
+                ? duration : "\(label) (\(duration))"
+        } else if ["monthly", "current month"].contains(raw) {
+            label = "Monthly"
+        } else if Self.normalizedProvider(provider.provider) == "openai-codex" {
+            for (suffix, neutral) in [("current session", "Primary"), ("session", "Primary"), ("current week", "Secondary"), ("weekly", "Secondary")] {
+                if raw == suffix {
+                    label = neutral
+                    break
+                }
+                if raw.hasSuffix(" " + suffix) {
+                    let prefix = String(label.dropLast(suffix.count)).trimmingCharacters(in: CharacterSet(charactersIn: " ·"))
+                    label = "\(prefix) · \(neutral)"
+                    break
+                }
+            }
+        }
+        if let bucket, !bucket.isEmpty {
+            label = "\(bucket) · \(label)"
+        } else if generic.contains(raw) || generic.contains(raw.replacingOccurrences(of: " quota", with: "")),
+                  let scope = window.scope, scope != "account", !scope.isEmpty {
+            label = "\(scope) · \(label)"
+        }
+        return label
+    }
+
+    private func applicableWindows(_ provider: QuotaProvider) -> [QuotaWindow] {
+        provider.windows.filter { window in
+            if let scope = window.scope { return ["account", "api-key"].contains(scope) }
+            return ["session", "current session", "weekly", "current week", "monthly", "current month", "calendar month", "account credits", "api key limit", "api key quota"].contains(window.label.lowercased())
+        }
     }
 
     private func providerIsExhausted(_ provider: QuotaProvider) -> Bool {
-        provider.status == "ok" && provider.windows.contains(where: \.limitReached)
+        guard provider.status == "ok", !provider.windows.isEmpty else { return false }
+        let account = applicableWindows(provider)
+        return account.isEmpty ? provider.windows.allSatisfy(\.limitReached) : account.contains(where: \.limitReached)
     }
 
     // The "Extra usage: 242.00 / 200.00 USD" overflow-spend line. It's noisy and
@@ -1930,7 +1966,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // (organizationType / rate-limit tier from ~/.claude.json) so a Team/Max/Pro
     // subscription shows even when the gateway payload carries no plan.
     private func displayPlan(_ provider: QuotaProvider) -> String? {
-        if let plan = provider.plan, !plan.isEmpty { return plan }
+        if let plan = provider.plan, !plan.isEmpty {
+            if Self.normalizedProvider(provider.provider) == "openai-codex" {
+                switch plan.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+                case "prolite": return "Pro"
+                case "pro": return "Pro (More)"
+                case "promax": return "Pro (Max)"
+                default: break
+                }
+            }
+            return plan
+        }
         if Self.normalizedProvider(provider.provider) == "anthropic" {
             return Self.claudeSubscriptionLabel
         }
@@ -2111,93 +2157,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
 
-    // Shortest relative time until any of this provider's windows reset, e.g.
-    // "in 6d". Used to surface the expiration in the collapsed provider row.
-    private func soonestResetText(_ provider: QuotaProvider) -> String? {
-        let dates = provider.windows.compactMap { parsedDate($0.resetsAt) }.filter { $0 > Date() }
-        guard let soonest = dates.min() else { return nil }
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .short
-        return formatter.localizedString(for: soonest, relativeTo: Date())
-    }
-
-    // Relative reset ("in 4h") for a single window's resets_at, e.g. the session
-    // window shown in the collapsed row.
-    private func relativeReset(_ resetsAt: String) -> String? {
-        guard let date = parsedDate(resetsAt), date > Date() else { return nil }
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .short
-        return formatter.localizedString(for: date, relativeTo: Date())
-    }
-
-    private func providerSummary(_ provider: QuotaProvider, connected: Bool) -> String {
-        // Per-provider status when the source is down, rather than repeating the
-        // whole connection summary on every row.
-        // Not connected (red ring) → say what to do: sign in.
+    private func providerSummary(_ provider: QuotaProvider, connected: Bool, includeReset: Bool = true) -> String {
         guard connected else { return "Disconnected · sign in" }
         guard provider.status == "ok" else {
             return provider.status.replacingOccurrences(of: "_", with: " ").capitalized
         }
-        // Session/weekly over-limit rule: once the session is spent (or the weekly
-        // itself is out), the session number is moot — summarise from the WEEKLY
-        // window instead of flagging the whole provider "over limit" off the spent
-        // session. If the weekly is the one that's out, say so with ITS reset.
-        if hideSessionWindow(provider), let weekly = weeklyWindow(provider), let pct = weekly.remainingPercent {
-            if weekly.limitReached {
-                if let resetsAt = weekly.resetsAt, let reset = relativeReset(resetsAt) {
-                    return "Weekly over limit · resets \(reset)"
-                }
-                return "Weekly over limit"
-            }
-            let base = "\(Int(pct.rounded()))% week left"
-            if let resetsAt = weekly.resetsAt, let reset = relativeReset(resetsAt) {
-                return "\(base) · resets \(reset)"
-            }
-            return base
+        guard let window = collapsedWindow(provider) else { return "Quota unavailable" }
+        let value: String
+        if let amount = window.remainingAmount {
+            value = "\(formattedAmount(amount, currency: window.currency)) available"
+        } else if window.limitReached {
+            value = "Limit reached"
+        } else if let percent = window.remainingPercent {
+            value = quotaPercentText(percent)
+        } else {
+            value = "Usage unavailable"
         }
-        let reached = provider.windows.filter(\.limitReached)
-        if !reached.isEmpty {
-            // Out of quota (yellow ring). Reset FIRST (so it never gets truncated off
-            // the row) — that reset time IS the thing to wait for, shown as a PRECISE
-            // countdown ("in 2h 15m") to match the expanded window rows. When there's
-            // no reset, credit-based providers just need a top-up, so say so.
-            let soonest = reached
-                .compactMap { w -> (String, Date)? in parsedDate(w.resetsAt).map { (w.resetsAt ?? "", $0) } }
-                .filter { $0.1 > Date() }
-                .min { $0.1 < $1.1 }
-            if let soonest, let precise = preciseCountdown(soonest.0) {
-                return "Resets in \(precise) · over limit"
-            }
-            if ["openrouter", "opencode"].contains(Self.normalizedProvider(provider.provider)) {
-                return "Over limit · add credits"
-            }
-            return "Over limit"
+        let base = "\(windowLabel(window, provider: provider)) · \(value)"
+        if includeReset, let reset = preciseCountdown(window.resetsAt) {
+            return "\(base) · resets in \(reset)"
         }
-        // OpenRouter-shaped rows (the env/~/.hermes key AND opencode's own key)
-        // carry a single "Account credits" window — summarise it as an amount.
-        if ["openrouter", "opencode"].contains(Self.normalizedProvider(provider.provider)),
-           let account = provider.windows.first(where: { $0.label == "Account credits" }),
-           let amount = account.remainingAmount {
-            return "\(formattedAmount(amount, currency: account.currency)) available"
-        }
-        // Collapsed row shows the CURRENT-SESSION window's % (not the min across
-        // windows) — and the reset time of that same session window, so the number
-        // and its reset match.
-        if let session = sessionWindow(provider), let pct = session.remainingPercent {
-            let base = pct <= 0 ? "No session quota" : "\(Int(pct.rounded()))% left"
-            if let precise = preciseCountdown(session.resetsAt) {
-                return "\(base) · resets in \(precise)"
-            }
-            return base
-        }
-        if let minimum = providerMinimum(provider) {
-            let base = minimum <= 0 ? "No quota available" : "\(Int(minimum.rounded()))% left"
-            if let reset = soonestResetText(provider) {
-                return "\(base) · resets \(reset)"
-            }
-            return base
-        }
-        return "Quota available"
+        return base
     }
 
     private func statusDotsImage() -> NSImage {
@@ -2276,33 +2256,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let amount = window.remainingAmount {
             displayValue = "\(formattedAmount(amount, currency: window.currency)) available"
         } else if let percent = window.remainingPercent {
-            displayValue = window.limitReached ? "Limit reached" : "\(Int(percent.rounded()))% left"
+            displayValue = window.limitReached ? "Limit reached" : quotaPercentText(percent)
         } else {
             displayValue = "Unavailable"
         }
 
         if window.limitReached {
-            // OUT OF LIMIT: keep it minimal — the window's "Limit reached" state, its
-            // reset countdown, and (unless this IS the weekly) how much weekly quota
-            // remains. No 0%-full bar, no absolute date, no reset suffix on the
-            // weekly line — just the three things that matter.
             let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 58))
-            view.addSubview(label(window.label, frame: NSRect(x: 28, y: 36, width: 170, height: 16), font: .systemFont(ofSize: 12, weight: .medium)))
-            view.addSubview(label("Limit reached", frame: NSRect(x: 190, y: 35, width: 150, height: 17), font: .monospacedDigitSystemFont(ofSize: 12, weight: .semibold), color: valueColor, alignment: .right))
+            view.addSubview(label(windowLabel(window, provider: provider), frame: NSRect(x: 28, y: 36, width: 170, height: 16), font: .systemFont(ofSize: 12, weight: .medium)))
+            view.addSubview(label(displayValue, frame: NSRect(x: 190, y: 35, width: 150, height: 17), font: .monospacedDigitSystemFont(ofSize: 12, weight: .semibold), color: valueColor, alignment: .right))
             let resetLine = preciseCountdown(window.resetsAt).map { "Resets in \($0)" } ?? "No reset time reported"
             view.addSubview(label(resetLine, frame: NSRect(x: 28, y: 19, width: 312, height: 15), font: .systemFont(ofSize: 11, weight: .medium), color: menuPrimaryColor()))
-            if let weekly = weeklyWindow(provider), weekly.label != window.label, let pct = weekly.remainingPercent {
-                let weeklyColor: NSColor = weekly.limitReached ? .hermesRed : (pct <= 15 ? .hermesOrange : menuSecondaryColor())
-                view.addSubview(label("Weekly: \(Int(pct.rounded()))% left", frame: NSRect(x: 28, y: 3, width: 312, height: 15), font: .systemFont(ofSize: 10.5, weight: .medium), color: weeklyColor))
+            if window.remainingAmount == nil, let percent = window.remainingPercent {
+                view.addSubview(label(quotaPercentText(percent), frame: NSRect(x: 28, y: 3, width: 312, height: 14), font: .monospacedDigitSystemFont(ofSize: 10, weight: .medium), color: valueColor))
             }
             return view
         }
 
         // In-quota: compact row — label + value, a thin bar, and a subtitle.
         let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 42))
-        view.addSubview(label(window.label, frame: NSRect(x: 28, y: 25, width: 170, height: 15), font: .systemFont(ofSize: 11, weight: .medium)))
-        view.addSubview(label(displayValue, frame: NSRect(x: 190, y: 24, width: 150, height: 16), font: .monospacedDigitSystemFont(ofSize: 11, weight: .semibold), color: valueColor, alignment: .right))
-        if window.remainingPercent != nil {
+        view.addSubview(label(windowLabel(window, provider: provider), frame: NSRect(x: 28, y: 25, width: 140, height: 15), font: .systemFont(ofSize: 11, weight: .medium)))
+        view.addSubview(label(displayValue, frame: NSRect(x: 174, y: 24, width: 166, height: 16), font: .monospacedDigitSystemFont(ofSize: 11, weight: .semibold), color: valueColor, alignment: .right))
+        if windowShowsBar(window, provider: provider) {
             let track = NSView(frame: NSRect(x: 28, y: 15, width: 312, height: 5))
             track.wantsLayer = true
             track.layer?.cornerRadius = 2.5

@@ -1,0 +1,30 @@
+{
+  "source": "https://github.com/rarf/hermes-quota-plugin",
+  "fixture": "codex_upstream.py",
+  "definition_hash_method": "SHA-256 of ast.get_source_segment for each top-level definition (excluding decorators)",
+  "files": {
+    "quota_providers/builtin.py": {
+      "sha256": "5bae4148595834a38c8c67e91c4877a9f8f29ef99cae7c72006769000f281112",
+      "definitions": {
+        "_fetch_codex_with_models": "c3fffe30308e2636b009e82fcf2b9e78b8b542bfa90347c82f44fe1eda3ff754"
+      }
+    },
+    "quota_providers/base.py": {
+      "sha256": "af70072622081e47e1aba4fd3dcc13960cb65030f11caa2ace0e145f4a0b0cb6",
+      "definitions": {
+        "QuotaWindow": "fd6574f2a5b7ec4a734cbc03aff0940ed1dff6263e2de9b94b8d655d2851855c",
+        "QuotaResult": "fa1c286afe0af0d242d6815784b70dc649c00e4de6f65def5102546ff4e88baa",
+        "build_unavailable": "b75fc223ffdc5b4ac0ab3c90563e0ee9ce567fcbbccbbedb3cfa500ae06a707c"
+      }
+    },
+    "quota_cache.py": {
+      "sha256": "2d1c9c8c8fa42ecb5cd9aa3e89f6b3b808ec85c1e9baaa41f2f0c9a7bbede820",
+      "definitions": {
+        "_result_to_record": "46bc2750f8ead0414b275e888312d6b9a2017a12e29e065ce4b72a383de322ba",
+        "_unavailable_record": "e0b0277609bf0800144e9163900c27b0245f4506013bc13c23c049ced8cd3cde",
+        "_fetch_one": "67da870e5b7c950e87d1990e69a54a860a18323a8df85ed8ddc9d1302b17591c",
+        "refresh_quota_cache": "b6c955b4d1d46572c1f40148229647a6496ced71d0ca419852e18c55516333be"
+      }
+    }
+  }
+}

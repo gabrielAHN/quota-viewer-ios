@@ -80,7 +80,7 @@ if let result {
         self.assertLess(elapsed, 2)
 
     def test_nonzero_exit_discards_partial_output(self):
-        output, _ = self.run_helper("os.write(1, b'partial')\nos.write(2, b'error')\nraise SystemExit(2)\n")
+        output, _ = self.run_helper("os.write(1, b'partial')\nos.write(2, b'error')\nraise SystemExit(2)\n", timeout=2)
         self.assertEqual(output, "NIL")
 
 
