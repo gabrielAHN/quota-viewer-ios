@@ -16,6 +16,29 @@ Two sources, both **off by default**, toggled from the `Sources` row:
 Enable either or both; each source's providers list under its own header, and a
 provider only appears if it's actually signed in.
 
+### Shared Desktop authentication
+
+The Hermes reader follows this Mac's primary Hermes Desktop connection and reads
+its saved access token. **Hermes Desktop owns token renewal**: the menu never
+rotates refresh tokens or writes Desktop's credential store. Keep Desktop running
+and connected so it can renew the session. If Desktop is closed, the menu can
+continue using the saved access token until the gateway rejects it.
+
+If Desktop updates credentials during a poll, the reader reloads them and retries
+with the new access token. Brief file-write gaps are retried too. An unavailable
+gateway or HTTP 403 is not presented as an expired login; only missing credentials
+or a confirmed HTTP 401 requests Desktop sign-in.
+
+Transient quota-fetch failures retain the last successful reading for up to two
+minutes, explicitly marked as stale. Longer outages show a retrying/unavailable
+state rather than asking you to sign in again.
+
+Normal polls use the gateway's quota cache instead of forcing provider refreshes.
+A silent quota connection times out after five seconds; activity requests time out
+after two seconds and stop contacting a failed gateway for the rest of that scan.
+The menu also bounds helper process execution so a stuck reader cannot hang a poll.
+No automatic sign-in, credential repair, or Hermes restart is attempted.
+
 ## Install
 
 **Homebrew** (easiest):

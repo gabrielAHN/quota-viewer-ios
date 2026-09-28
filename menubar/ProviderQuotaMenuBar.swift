@@ -636,10 +636,22 @@ final class ActivityPetsView: NSView {
         }
     }
 
+    static func decodedSprite(at url: URL) -> NSImage? {
+        guard let image = NSImage(contentsOf: url),
+              let source = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
+              let bitmap = CGContext(data: nil, width: source.width, height: source.height,
+                                     bitsPerComponent: 8, bytesPerRow: source.width * 4,
+                                     space: CGColorSpaceCreateDeviceRGB(),
+                                     bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        bitmap.draw(source, in: CGRect(x: 0, y: 0, width: source.width, height: source.height))
+        guard let decoded = bitmap.makeImage() else { return nil }
+        return NSImage(cgImage: decoded, size: image.size)
+    }
+
     private func loadArt() {
         for tile in tiles {
             guard let pet = tile.pet else { continue }
-            if sheetCache[pet.id] == nil, let img = NSImage(contentsOf: pet.spritesheetURL) {
+            if sheetCache[pet.id] == nil, let img = Self.decodedSprite(at: pet.spritesheetURL) {
                 sheetCache[pet.id] = img
                 frameCounts[pet.id] = Self.detectFramesPerRow(img)
             }
@@ -1201,6 +1213,43 @@ final class ActivityPetsPanel: NSPanel {
     }
 }
 
+struct SourceFailurePolicy {
+    enum State { case healthy, stale, unavailable, authenticationRequired }
+    private(set) var state: State = .unavailable
+    private(set) var lastSuccess: TimeInterval?
+    static let grace: TimeInterval = 120
+
+    var message: String? {
+        switch state {
+        case .healthy: return nil
+        case .stale: return "Updating… · showing last reading"
+        case .unavailable: return "Gateway unavailable — retrying"
+        case .authenticationRequired: return "Not signed in — sign in to see quotas"
+        }
+    }
+
+    mutating func succeeded(at now: TimeInterval) {
+        lastSuccess = now
+        state = .healthy
+    }
+
+    mutating func failed(_ error: Error, isHermes: Bool, at now: TimeInterval) {
+        let error = error as NSError
+        if !isHermes || (error.domain == "ProviderQuotaMenuBar" && error.code == 2) {
+            lastSuccess = nil
+            state = .authenticationRequired
+        } else if state != .authenticationRequired {
+            state = lastSuccess.map { now >= $0 && now - $0 < Self.grace } == true ? .stale : .unavailable
+        }
+    }
+
+    mutating func expire(at now: TimeInterval) {
+        if state == .stale, let lastSuccess, now - lastSuccess >= Self.grace {
+            state = .unavailable
+        }
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
@@ -1217,7 +1266,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let providers: [QuotaProvider]
         let connected: Bool
         let generatedAt: String?
+        var failureState: SourceFailurePolicy.State = .healthy
     }
+    private var sourcePolicies: [GatewayKind: SourceFailurePolicy] = [:]
+    private var staleExpiryTimer: Timer?
     private var sources: [SourceQuota] = []
     // Sources just switched on and awaiting their first fetch — shown with a
     // spinner ("Activating …") until the fetch that follows completes.
@@ -1299,7 +1351,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Every enabled source is down (or none is enabled) — drives the "not
     // working" pet + a sign-in prompt.
     private var needsLogin: Bool {
-        !enabledGateways().isEmpty && !anyConnected
+        sources.contains { $0.failureState == .authenticationRequired }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -2200,12 +2252,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let enabled = enabledGateways()
         if enabled.isEmpty { return "Nothing enabled — enable Hermes or Local" }
         if needsLogin {
-            let names = enabled.map { sourceName($0) }.joined(separator: " and ")
+            let names = sources.filter { $0.failureState == .authenticationRequired }.map { sourceName($0.kind) }.joined(separator: " and ")
             return "Sign in to \(names) to see quotas"
         }
         // Per-source status, e.g. "Hermes connected · Local disconnected".
         return enabled.map { kind in
             let connected = sources.first { $0.kind == kind }?.connected ?? false
+            if let message = sourcePolicies[kind]?.message { return "\(sourceName(kind)): \(message)" }
             return "\(sourceName(kind)) \(connected ? "connected" : "disconnected")"
         }.joined(separator: " · ")
     }
@@ -2309,6 +2362,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // quota — just a "sign in to fix" prompt with the login button right here in
     // the provider window (not only the small header icon).
     private func disconnectedPromptView(_ source: SourceQuota) -> NSView {
+        if source.failureState == .unavailable {
+            return messageView("Gateway unavailable — retrying", color: .hermesOrange)
+        }
         let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 44))
         let icon = NSImageView(frame: NSRect(x: 30, y: 14, width: 16, height: 16))
         icon.image = NSImage(systemSymbolName: "person.crop.circle.badge.exclamationmark", accessibilityDescription: nil)
@@ -2474,7 +2530,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             point.imageScaling = .scaleProportionallyDown
             chip.addSubview(point)
         } else {
-            let state = !on ? "Off" : loading ? "Activating" : "Sign in"
+            let unavailable = sources.first { $0.kind == kind }?.failureState == .unavailable
+            let state = !on ? "Off" : loading ? "Activating" : unavailable ? "Retrying" : "Sign in"
             let pillW: CGFloat = 62
             let statePill = NSView(frame: NSRect(x: frame.width - pillW - 12, y: (frame.height - 17) / 2, width: pillW, height: 17))
             statePill.wantsLayer = true
@@ -3002,6 +3059,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     continue
                 }
                 addView(sourceHeaderView(source))
+                if source.failureState == .stale {
+                    addView(messageView("Updating… · showing last reading", color: .hermesOrange))
+                }
                 if source.connected {
                     // Shown providers first, then the hidden ones grouped UNDER
                     // them as short rows (name + eye + colour point only — see
@@ -3161,7 +3221,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Its header shows a spinner meanwhile.
     @objc private func refreshSourceAction(_ sender: NSButton) {
         guard let raw = sender.identifier?.rawValue, let kind = GatewayKind(rawValue: raw) else { return }
-        guard !refreshingKinds.contains(kind) else { return }
+        guard !refreshing, !refreshingKinds.contains(kind) else { return }
         refreshingKinds.insert(kind)
         rebuildMenu()
         DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -3169,16 +3229,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.refreshingKinds.remove(kind)
-                switch result {
-                case .success(let payload):
-                    let providers = self.applyLastGood(payload.providers, kind: kind)
-                    self.upsertSource(SourceQuota(kind: kind, providers: providers, connected: true, generatedAt: payload.generatedAt))
-                    self.lastProvidersByKind[kind.rawValue] = providers.map { ($0.provider, $0.label) }
-                    UserDefaults.standard.set(providers.map { $0.provider }, forKey: "lastProviderSlugs.\(kind.rawValue)")
-                    UserDefaults.standard.set(providers.map { $0.label }, forKey: "lastProviderLabels.\(kind.rawValue)")
-                case .failure:
-                    self.upsertSource(SourceQuota(kind: kind, providers: self.disconnectedProviders(for: kind), connected: false, generatedAt: nil))
-                }
+                self.activating.remove(kind)
+                self.upsertSource(self.sourceQuota(for: kind, result: result))
                 self.noteQuotaTransitions()   // catch any provider that just reset
                 self.updateStatusItem()
                 self.rebuildMenu()
@@ -3188,6 +3240,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // Replace (or insert) one source, keeping the Hermes-before-Local order.
+    private func sourceQuota(for kind: GatewayKind, result: Result<QuotaPayload, Error>) -> SourceQuota {
+        guard gatewayEnabled(kind) else {
+            return SourceQuota(kind: kind, providers: [], connected: false, generatedAt: nil, failureState: .unavailable)
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        var policy = sourcePolicies[kind] ?? SourceFailurePolicy()
+        if kind == .hermes { staleExpiryTimer?.invalidate() }
+        switch result {
+        case .success(let payload):
+            policy.succeeded(at: now)
+            sourcePolicies[kind] = policy
+            let providers = applyLastGood(payload.providers, kind: kind)
+            lastProvidersByKind[kind.rawValue] = providers.map { ($0.provider, $0.label) }
+            UserDefaults.standard.set(providers.map { $0.provider }, forKey: "lastProviderSlugs.\(kind.rawValue)")
+            UserDefaults.standard.set(providers.map { $0.label }, forKey: "lastProviderLabels.\(kind.rawValue)")
+            return SourceQuota(kind: kind, providers: providers, connected: true, generatedAt: payload.generatedAt)
+        case .failure(let error):
+            policy.failed(error, isHermes: kind == .hermes, at: now)
+            sourcePolicies[kind] = policy
+            if policy.state == .stale, let lastSuccess = policy.lastSuccess,
+               let previous = sources.first(where: { $0.kind == kind && $0.connected }) {
+                let timer = Timer(timeInterval: max(0.001, lastSuccess + SourceFailurePolicy.grace - now), repeats: false) { [weak self] _ in
+                    self?.expireStaleSource(kind)
+                }
+                staleExpiryTimer = timer
+                RunLoop.main.add(timer, forMode: .common)
+                return SourceQuota(kind: kind, providers: previous.providers, connected: true, generatedAt: previous.generatedAt, failureState: .stale)
+            }
+            return SourceQuota(kind: kind, providers: disconnectedProviders(for: kind), connected: false, generatedAt: nil, failureState: policy.state)
+        }
+    }
+
+    private func expireStaleSource(_ kind: GatewayKind) {
+        guard var policy = sourcePolicies[kind], policy.state == .stale else { return }
+        policy.expire(at: ProcessInfo.processInfo.systemUptime)
+        sourcePolicies[kind] = policy
+        guard policy.state == .unavailable else { return }
+        upsertSource(SourceQuota(kind: kind, providers: disconnectedProviders(for: kind), connected: false, generatedAt: nil, failureState: .unavailable))
+        updateStatusItem()
+        rebuildMenu()
+        updateActivityPets()
+    }
+
     private func upsertSource(_ source: SourceQuota) {
         // Drop a result for a source disabled while its fetch was in flight — it
         // must not re-add that source's dots after the user turned it off.
@@ -3242,6 +3337,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // Disabling a source removes ALL of its providers: drop it from the
             // live list AND its cached copy so nothing linked to it lingers.
             sources.removeAll { $0.kind == kind }
+            sourcePolicies[kind] = nil
+            if kind == .hermes { staleExpiryTimer?.invalidate() }
             lastProvidersByKind[kind.rawValue] = nil
             UserDefaults.standard.removeObject(forKey: "lastProviderSlugs.\(kind.rawValue)")
             UserDefaults.standard.removeObject(forKey: "lastProviderLabels.\(kind.rawValue)")
@@ -3310,19 +3407,85 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private static func runHelper(_ path: String, _ args: [String]) -> Data? {
-        let proc = Process()
-        // Run via a login shell so the helper's `#!/usr/bin/env bash` shebang and
-        // its tools resolve regardless of the launch PATH (same as the quota path).
-        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-        proc.arguments = ["-lc", "exec \"$0\" \"$@\"", path] + args
-        let out = Pipe()
-        proc.standardOutput = out
-        proc.standardError = Pipe()
-        do { try proc.run() } catch { return nil }
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        proc.waitUntilExit()
-        return proc.terminationStatus == 0 ? data : nil
+    private static func runHelper(_ path: String, _ args: [String], timeout: TimeInterval? = nil) -> Data? {
+        try? executeHelper(path, args, timeout: timeout ?? (args.contains("--activity") ? 8 : 20))
+    }
+
+    private static func executeHelper(_ path: String, _ args: [String], timeout: TimeInterval = 20) throws -> Data {
+        final class Reader {
+            let pipe = Pipe()
+            let queue = DispatchQueue(label: "ProviderQuotaMenuBar.helper-output")
+            var source: DispatchSourceRead!
+            var data = Data()
+            var ended = false
+
+            init() {
+                let handle = pipe.fileHandleForReading
+                let fd = handle.fileDescriptor
+                _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
+                source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+                source.setEventHandler { [weak self] in self?.drain() }
+                source.setCancelHandler { handle.closeFile() }
+                source.resume()
+            }
+
+            func drain() {
+                guard !ended else { return }
+                var buffer = [UInt8](repeating: 0, count: 65536)
+                for _ in 0..<16 {
+                    let count = read(pipe.fileHandleForReading.fileDescriptor, &buffer, buffer.count)
+                    if count > 0 {
+                        data.append(contentsOf: buffer.prefix(count))
+                    } else if count < 0 && errno == EINTR {
+                        continue
+                    } else {
+                        if count == 0 { ended = true; source.cancel() }
+                        break
+                    }
+                }
+            }
+
+            func close() {
+                queue.sync {
+                    ended = true
+                    source.cancel()
+                    pipe.fileHandleForWriting.closeFile()
+                }
+            }
+        }
+
+        let process = Process()
+        let output = Reader()
+        let errors = Reader()
+        defer {
+            output.close()
+            errors.close()
+        }
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = ["-lc", "exec \"$0\" \"$@\"", path] + args
+        process.standardOutput = output.pipe
+        process.standardError = errors.pipe
+        let done = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in done.signal() }
+        try process.run()
+        let timedOut = done.wait(timeout: .now() + timeout) == .timedOut
+        if timedOut {
+            process.terminate()
+            if done.wait(timeout: .now() + .milliseconds(200)) == .timedOut {
+                kill(process.processIdentifier, SIGKILL)
+            }
+        }
+        process.waitUntilExit()
+        if timedOut {
+            throw NSError(domain: "ProviderQuotaMenuBar", code: Int(ETIMEDOUT), userInfo: [NSLocalizedDescriptionKey: "\(URL(fileURLWithPath: path).lastPathComponent) timed out"])
+        }
+        let outputData = output.queue.sync { output.drain(); return output.data }
+        let errorData = errors.queue.sync { errors.drain(); return errors.data }
+        if process.terminationStatus != 0 {
+            let message = String(data: errorData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "Helper request failed"
+            throw NSError(domain: "ProviderQuotaMenuBar", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: message])
+        }
+        return outputData
     }
 
     // Rebuild the floating pets: ONE pet per enabled source (Hermes / Local) whose
@@ -3377,7 +3540,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if activating.contains(kind) { continue }
             let connected = sources.first { $0.kind == kind }?.connected ?? false
             if !connected {
-                tiles.append(PetTile(instance: Self.needsLoginPlaceholder(gateway: sourceName(kind)), pet: pet, sourceKey: kind.rawValue))
+                tiles.append(PetTile(instance: Self.needsLoginPlaceholder(gateway: sourceName(kind), title: sources.first { $0.kind == kind }?.failureState == .unavailable ? "Gateway unavailable — retrying" : "Sign in"), pet: pet, sourceKey: kind.rawValue))
                 continue
             }
 
@@ -3937,7 +4100,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // A "not working" pet: the error/struggling animation + red halo + "!" badge
     // (drawPet/drawNukey render status "failed" that way), signalling the source
     // is disconnected and needs a sign-in.
-    private static func needsLoginPlaceholder(gateway: String) -> ProviderActivityInstance {
+    private static func needsLoginPlaceholder(gateway: String, title: String) -> ProviderActivityInstance {
         ProviderActivityInstance(
             completedAt: nil,
             key: "needs-login",
@@ -3949,7 +4112,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             sessionId: "",
             startedAt: Date().timeIntervalSince1970,
             status: "failed",
-            title: "Sign in"
+            title: title
         )
     }
 
@@ -3995,7 +4158,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func refresh() {
-        guard !refreshing else { return }
+        guard !refreshing, refreshingKinds.isEmpty else { return }
         refreshing = true
         let kinds = enabledGateways()   // fetch EVERY enabled source
         // A source with no data yet is LOADING — mark it activating so its pet stays
@@ -4018,18 +4181,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.desktopStatus = desktop
                 var built: [SourceQuota] = []
                 for (kind, result) in results {
-                    switch result {
-                    case .success(let payload):
-                        let providers = self.applyLastGood(payload.providers, kind: kind)
-                        built.append(SourceQuota(kind: kind, providers: providers, connected: true, generatedAt: payload.generatedAt))
-                        // Remember this source's provider list for a later disconnect.
-                        self.lastProvidersByKind[kind.rawValue] = providers.map { ($0.provider, $0.label) }
-                        UserDefaults.standard.set(payload.providers.map { $0.provider }, forKey: "lastProviderSlugs.\(kind.rawValue)")
-                        UserDefaults.standard.set(payload.providers.map { $0.label }, forKey: "lastProviderLabels.\(kind.rawValue)")
-                    case .failure:
-                        // Source down → list its known providers as Disconnected.
-                        built.append(SourceQuota(kind: kind, providers: self.disconnectedProviders(for: kind), connected: false, generatedAt: nil))
-                    }
+                    built.append(self.sourceQuota(for: kind, result: result))
                 }
                 // Keep only sources still enabled at completion — a source disabled
                 // while this fetch was in flight must not reappear (the toggle-off lag).
@@ -4072,38 +4224,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private static func runHelper(_ name: String) -> Result<QuotaPayload, Error> {
-        let process = Process()
-        let output = Pipe()
-        let errors = Pipe()
         let helper = helperPath(name)
         guard FileManager.default.isExecutableFile(atPath: helper) else {
             return .failure(NSError(domain: "ProviderQuotaMenuBar", code: 127, userInfo: [NSLocalizedDescriptionKey: "\(name) is not installed"]))
         }
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = ["-lc", "exec \"$0\"", helper]
-        process.standardOutput = output
-        process.standardError = errors
         do {
-            try process.run()
-            // Guard against a wedged reader stalling the whole source (which made
-            // a fast provider like Claude lag behind a slow/hung one): kill the
-            // helper if it outruns this budget and treat it as a failed fetch.
-            let deadline = DispatchTime.now() + .seconds(20)
-            let done = DispatchSemaphore(value: 0)
-            DispatchQueue.global(qos: .utility).async {
-                process.waitUntilExit()
-                done.signal()
-            }
-            if done.wait(timeout: deadline) == .timedOut {
-                process.terminate()
-                throw NSError(domain: "ProviderQuotaMenuBar", code: Int(ETIMEDOUT), userInfo: [NSLocalizedDescriptionKey: "\(name) timed out"])
-            }
-            let data = output.fileHandleForReading.readDataToEndOfFile()
-            if process.terminationStatus != 0 {
-                let errorData = errors.fileHandleForReading.readDataToEndOfFile()
-                let message = String(data: errorData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "\(name) request failed"
-                throw NSError(domain: "ProviderQuotaMenuBar", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: message])
-            }
+            let data = try executeHelper(helper, [])
             return .success(try JSONDecoder().decode(QuotaPayload.self, from: data))
         } catch {
             return .failure(error)
