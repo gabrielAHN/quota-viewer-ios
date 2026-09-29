@@ -23,7 +23,7 @@
 # exits non-zero, so the app can show a "sign in" state.
 set -euo pipefail
 exec /usr/bin/env python3 - "$@" <<'PY'
-import base64, json, os, subprocess, sys, time, urllib.request, urllib.error
+import base64, json, math, os, subprocess, sys, time, urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -327,6 +327,32 @@ def anthropic_provider():
         used = max(0.0, min(100.0, float(util)))
         result = _window(wlabel, used, resets_at=window.get("resets_at"))
         result.update(window_seconds=seconds, scope=scope, window_id=key)
+        windows.append(result)
+    models = {w["scope"] for w in windows if w["scope"] != "account"}
+    limits = payload.get("limits")
+    for limit in limits if isinstance(limits, list) else []:
+        if not isinstance(limit, dict) or limit.get("kind") != "weekly_scoped":
+            continue
+        percent = limit.get("percent")
+        if not isinstance(percent, (int, float)) or isinstance(percent, bool) or not math.isfinite(percent):
+            continue
+        scope = limit.get("scope")
+        model = scope.get("model") if isinstance(scope, dict) else None
+        if not isinstance(model, dict):
+            continue
+        name = next((v.strip() for v in (model.get("display_name"), model.get("id"))
+                     if isinstance(v, str) and v.strip()), "")
+        if not name or name.lower() in models:
+            continue
+        models.add(name.lower())
+        reset = limit.get("resets_at")
+        try:
+            datetime.fromisoformat(reset[:-1] + "+00:00" if reset.endswith("Z") else reset)
+        except (AttributeError, TypeError, ValueError):
+            reset = None
+        result = _window(f"{name} week", percent, resets_at=reset)
+        result.update(window_seconds=604800 if limit.get("group") == "weekly" else None,
+                      scope=f"model:{name}", window_id=f"weekly_scoped:{name}")
         windows.append(result)
     details = []
     extra = payload.get("extra_usage") or {}

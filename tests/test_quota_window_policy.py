@@ -211,6 +211,21 @@ print(String(data: try JSONSerialization.data(withJSONObject: result), encoding:
         opus = self.window("Opus week", 42, scope="opus", window_seconds=604800)
         self.assertEqual(self.policy([opus], "anthropic")["summary"], "Opus · Weekly · 58% used · 42% left")
 
+    def claude_windows(self, fable=100, session=69, week=80):
+        return [self.window("Current session", session, scope="account", window_seconds=18000, window_id="five_hour"),
+                self.window("Current week", week, scope="account", window_seconds=604800, window_id="seven_day"),
+                self.window("Fable week", fable, scope="model:Fable", window_seconds=604800, window_id="weekly_scoped:Fable")]
+
+    def test_claude_model_scoped_weekly_stays_out_of_collapsed_account_summary(self):
+        for fable in (100, 0):
+            with self.subTest(fable=fable):
+                result = self.policy(self.claude_windows(fable), "anthropic")
+                self.assertFalse(result["exhausted"])
+                self.assertEqual(result["percent"], 69)
+                self.assertEqual(result["summary"], "5h · 31% used · 69% left")
+                self.assertEqual(result["visible"], ["Current session", "Current week", "Fable week"])
+        self.assertTrue(self.policy(self.claude_windows(100, session=0), "anthropic")["exhausted"])
+
     def test_positive_fraction_is_not_exhausted(self):
         result = self.policy([self.window("Session", 0.4)])
         self.assertFalse(result["exhausted"])
