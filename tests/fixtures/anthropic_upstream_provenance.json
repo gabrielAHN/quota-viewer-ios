@@ -1,0 +1,30 @@
+{
+  "source": "https://github.com/NousResearch/hermes-agent (ac4181fdfaa4fa3b0682ea7b592c7a3ee6465e62) and https://github.com/rarf/hermes-quota-plugin",
+  "fixture": "anthropic_upstream.py",
+  "definition_hash_method": "SHA-256 of ast.get_source_segment for each top-level definition (excluding decorators)",
+  "files": {
+    "agent/account_usage.py": {
+      "sha256": "50bac6e67c7c35dfd0505deed2e3105a324b5de669656feffed65e42b72cdc90",
+      "definitions": {
+        "_utc_now": "6594efc27ce62fbefb96ac418c06c682d9e61d09ef318e82d3e63be3008bae84",
+        "AccountUsageWindow": "791e94afc5222ff7e7cc20a58048c1a7c9e1d6b0cb5afd9391a1fcbd9568f2fc",
+        "AccountUsageSnapshot": "aa35edd52789131408047c1e87da178631a5d796471dcddc91d3545d988b30f8",
+        "_snapshot": "799783b94bc7da0d83710ca243622944af639e70a37332010f1a118f8358522f",
+        "_parse_dt": "874d94e9f20b8ad4a897fba61b31b329c88d7e15462003270833f1f562c1b303",
+        "_is_num": "c03be986640de2efa08eb7bfc02f00642fda5624da33ad77360fd8ae87427229",
+        "_get_json": "fd4172ee470431ae65842643dae8afca413bef972719b6b5aa6c1864c9e8867f",
+        "_usage_windows": "1b39b80710e7cf62b6da949db4bfbf63aba8e54cd74b49a6bd2275d433271ce1",
+        "_fetch_anthropic_account_usage": "a8750521a464c1e4b11dddd707a5567f1c54db48581bae2e68e04f6eae655942"
+      }
+    },
+    "quota_providers/builtin.py": {
+      "sha256": "5bae4148595834a38c8c67e91c4877a9f8f29ef99cae7c72006769000f281112",
+      "definitions": {
+        "_snapshot_to_result": "d73a2e5e162d1651ef508c075964d0b9573a9b744d8c9191c05b79f85b138e15",
+        "_core_fetch_account_usage": "839b91ca42ee6cfcb2447de53064119b6d87a0e60a6da53164ff13b0c218b944",
+        "_core_anthropic_token": "124211fd2ab8f90c25ade6646610c4ac36d0d080f365ecea7988a0dd4e0ee7f5",
+        "_fetch_anthropic": "63d464e5514f09f8c2871afbd97c29eaa0ee69c7d60d545e69f10c6fb23d7f6d"
+      }
+    }
+  }
+}

@@ -1,8 +1,8 @@
-"""Process-local bridge for the official quota plugin's legacy Codex windows.
+"""Process-local bridge for the official quota plugin's Codex and Claude windows.
 
 Install only inside the existing short-lived refresh subprocess. Observe JSON
-already fetched by Codex; never fetch, renew credentials, or patch upstream files.
-Unsupported response/model/serializer shapes leave the official result unchanged.
+already fetched by each provider; never fetch, renew credentials, or patch upstream
+files. Unsupported response/model/serializer shapes leave the official result unchanged.
 """
 from dataclasses import fields, is_dataclass, make_dataclass, replace
 from datetime import datetime, timezone
@@ -12,6 +12,17 @@ import threading
 from urllib.parse import urlsplit
 
 _KEYS = ('window_seconds', 'scope', 'window_id')
+_PROVIDERS = ('openai-codex', 'anthropic')
+_ENDPOINTS = {
+    'openai-codex': (('chatgpt.com', 'chat.openai.com'), ('/backend-api/wham/usage', '/wham/usage')),
+    'anthropic': (('api.anthropic.com',), ('/api/oauth/usage',)),
+}
+_CLAUDE_WINDOWS = (
+    ('five_hour', 'Current session', 'account', 18000),
+    ('seven_day', 'Current week', 'account', 604800),
+    ('seven_day_opus', 'Opus week', 'opus', 604800),
+    ('seven_day_sonnet', 'Sonnet week', 'sonnet', 604800),
+)
 
 
 def _number(value):
@@ -69,32 +80,119 @@ def _project(payload):
     return rows
 
 
+
+def _claude_reset(value):
+    if value in (None, ''):
+        return None
+    if isinstance(value, bool):
+        raise ValueError('unsupported reset')
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), timezone.utc).isoformat()
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError('unsupported reset')
+    text = value.strip()
+    text = text[:-1] + '+00:00' if text.endswith('Z') else text
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).isoformat()
+
+
+def _project_claude(payload):
+    """Retain only aligned Claude window facts; utilization is always a percent."""
+    if not isinstance(payload, dict):
+        return None
+    core, extra, models = [], [], set()
+    for key, label, scope, seconds in _CLAUDE_WINDOWS:
+        raw = payload.get(key) or {}
+        if not isinstance(raw, dict):
+            return None
+        used = raw.get('utilization')
+        if used is None:
+            continue
+        if not _number(used):
+            return None
+        used = float(used)
+        scaled = used * 100 if used <= 1 else used
+        core.append(((label, {used, scaled}, _claude_reset(raw.get('resets_at'))), used,
+                     {'window_seconds': seconds, 'scope': scope, 'window_id': key}))
+        if scope != 'account':
+            models.add(scope)
+    limits = payload.get('limits')
+    if limits is None:
+        limits = []
+    if not isinstance(limits, list):
+        return None
+    for limit in limits:
+        if not isinstance(limit, dict) or limit.get('kind') != 'weekly_scoped' or not _number(limit.get('percent')):
+            continue
+        scope = limit.get('scope')
+        model = scope.get('model') if isinstance(scope, dict) else None
+        if not isinstance(model, dict):
+            continue
+        name = next((str(v).strip() for v in (model.get('display_name'), model.get('id'))
+                     if isinstance(v, str) and v.strip()), '')
+        if not name or name.lower() in models:
+            continue
+        models.add(name.lower())
+        try:
+            reset = _claude_reset(limit.get('resets_at'))
+        except ValueError:
+            reset = None
+        extra.append((f'{name} week', float(limit['percent']), reset, {
+            'window_seconds': 604800 if limit.get('group') == 'weekly' else None,
+            'scope': f'model:{name}', 'window_id': f'weekly_scoped:{name}'}))
+    return core, extra
+
+
+def _with_metadata(window, label, metadata, **overrides):
+    native = any(getattr(window, key, None) is not None for key in _KEYS)
+    additions = {key: getattr(window, key, None) if getattr(window, key, None) is not None else value
+                 for key, value in metadata.items()}
+    label = window.label if native else label
+    field_names = {field.name for field in fields(window)}
+    missing = [key for key in additions if key not in field_names]
+    if missing:
+        cls = make_dataclass('MetadataWindow', [(key, object, None) for key in missing],
+                             bases=(type(window),), frozen=window.__dataclass_params__.frozen)
+        values = {field.name: getattr(window, field.name) for field in fields(window) if field.init}
+        values.update(additions, **overrides)
+        values['label'] = label
+        return cls(**values)
+    return replace(window, label=label, **additions, **overrides)
+
+
+def _enrich_claude(result, projection):
+    if result is None or result.label != 'anthropic' or result.unavailable_reason or projection is None:
+        return result
+    core, extra = projection
+    windows = list(result.windows)
+    if not windows or len(windows) != len(core) or not all(is_dataclass(w) for w in windows):
+        return result
+    if len({_signature(w) for w in windows}) != len(windows):
+        return result
+    updated = []
+    for window, ((label, used_values, reset), used, metadata) in zip(windows, core):
+        if window.label != label or window.used_percent not in used_values or window.reset_at != reset:
+            return result
+        updated.append(_with_metadata(window, label, metadata, used_percent=used))
+    template = type(windows[0])
+    for label, used, reset, metadata in extra:
+        updated.append(_with_metadata(template(label=label, used_percent=used, reset_at=reset), label, metadata))
+    return replace(result, windows=updated)
+
+
 def _enrich(result, rows):
     if result is None or result.label != 'openai-codex' or result.unavailable_reason or rows is None:
         return result
     signatures = [_signature(w) for w in result.windows]
     if signatures != [row[0] for row in rows] or len(set(signatures)) != len(signatures):
         return result
-    updated = []
-    for window, (_, label, metadata) in zip(result.windows, rows):
-        if not is_dataclass(window):
-            return result
-        native = any(getattr(window, key, None) is not None for key in _KEYS)
-        additions = {key: getattr(window, key, None) if getattr(window, key, None) is not None else value
-                     for key, value in metadata.items()}
-        field_names = {field.name for field in fields(window)}
-        missing = [key for key in additions if key not in field_names]
-        if missing:
-            cls = make_dataclass('MetadataWindow', [(key, object, None) for key in missing],
-                                 bases=(type(window),), frozen=window.__dataclass_params__.frozen)
-            values = {field.name: getattr(window, field.name) for field in fields(window) if field.init}
-            values.update(additions)
-            values['label'] = window.label if native else label
-            cloned = cls(**values)
-        else:
-            cloned = replace(window, label=window.label if native else label, **additions)
-        updated.append(cloned)
-    return replace(result, windows=updated)
+    if not all(is_dataclass(window) for window in result.windows):
+        return result
+    return replace(result, windows=[_with_metadata(window, label, metadata)
+                                    for window, (_, label, metadata) in zip(result.windows, rows)])
 
 
 def install(cache=None, httpx_module=None):
@@ -104,52 +202,57 @@ def install(cache=None, httpx_module=None):
             from quota import quota_cache as cache
         if httpx_module is None:
             import httpx as httpx_module
-        if getattr(cache, '_codex_metadata_compat_installed', False):
+        if getattr(cache, '_quota_metadata_compat_installed', False):
             return True
         registry = cache.PROVIDER_FETCHERS
-        fetch = registry['openai-codex']
+        fetchers = {pid: registry[pid] for pid in _PROVIDERS if callable(registry.get(pid))}
         serialize = cache._result_to_record
         response_type = httpx_module.Response
         original_json = response_type.json
-        if not all(callable(fn) for fn in (fetch, serialize, original_json)):
+        if not fetchers or not all(callable(fn) for fn in (serialize, original_json)):
             return False
     except Exception:
         return False
     local = threading.local()
+    projections = {'openai-codex': _project, 'anthropic': _project_claude}
+    enrichers = {'openai-codex': _enrich, 'anthropic': _enrich_claude}
 
     @wraps(original_json)
     def observed_json(response, *args, **kwargs):
         payload = original_json(response, *args, **kwargs)
         if getattr(local, 'active', False):
             try:
+                hosts, paths = _ENDPOINTS[local.provider]
                 url = urlsplit(str(response.request.url))
-                if url.scheme == 'https' and url.hostname in ('chatgpt.com', 'chat.openai.com') and url.path in ('/backend-api/wham/usage', '/wham/usage'):
+                if url.scheme == 'https' and url.hostname in hosts and url.path in paths:
                     local.count += 1
-                    local.rows = _project(payload) if local.count == 1 else None
+                    local.rows = projections[local.provider](payload) if local.count == 1 else None
             except Exception:
                 local.rows = None
         return payload
 
-    @wraps(fetch)
-    def fetch_with_metadata(*args, **kwargs):
-        if getattr(local, 'active', False):
-            local.rows = None
-            return fetch(*args, **kwargs)
-        local.active, local.rows, local.count = True, None, 0
-        try:
-            result = fetch(*args, **kwargs)
+    def wrap(provider, fetch):
+        @wraps(fetch)
+        def fetch_with_metadata(*args, **kwargs):
+            if getattr(local, 'active', False):
+                local.rows = None
+                return fetch(*args, **kwargs)
+            local.active, local.provider, local.rows, local.count = True, provider, None, 0
             try:
-                return _enrich(result, local.rows)
-            except Exception:
-                return result
-        finally:
-            local.__dict__.clear()
+                result = fetch(*args, **kwargs)
+                try:
+                    return enrichers[provider](result, local.rows)
+                except Exception:
+                    return result
+            finally:
+                local.__dict__.clear()
+        return fetch_with_metadata
 
     @wraps(serialize)
     def serialize_with_metadata(result, *args, **kwargs):
         record = serialize(result, *args, **kwargs)
         try:
-            if result.label != 'openai-codex':
+            if result.label not in fetchers:
                 return record
             windows = record['windows']
             if len(windows) != len(result.windows) or any(
@@ -171,12 +274,13 @@ def install(cache=None, httpx_module=None):
 
     try:
         response_type.json = observed_json
-        registry['openai-codex'] = fetch_with_metadata
+        for provider, fetch in fetchers.items():
+            registry[provider] = wrap(provider, fetch)
         cache._result_to_record = serialize_with_metadata
-        cache._codex_metadata_compat_installed = True
+        cache._quota_metadata_compat_installed = True
         return True
     except Exception:
         response_type.json = original_json
-        registry['openai-codex'] = fetch
+        registry.update(fetchers)
         cache._result_to_record = serialize
         return False
