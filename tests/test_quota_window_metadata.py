@@ -172,6 +172,51 @@ class LocalCodexWindowTests(unittest.TestCase):
             ("account", 18000, "five_hour"), ("account", 604800, "seven_day"),
             ("opus", 604800, "seven_day_opus"), ("sonnet", 604800, "seven_day_sonnet")])
 
+    def claude(self, payload):
+        with patch.dict(self.reader, {
+            "_anthropic_token": lambda: "sk-ant-oat-fixture",
+            "_get": lambda *args, **kwargs: copy.deepcopy(payload),
+        }):
+            return self.reader["anthropic_provider"]()
+
+    def test_local_claude_adds_model_scoped_weekly_limits(self):
+        result = self.claude({
+            "five_hour": {"utilization": 31, "resets_at": "2099-10-04T05:00:00Z"},
+            "seven_day": {"utilization": 20, "resets_at": "2099-10-08T00:00:00Z"},
+            "seven_day_opus": {"utilization": 5}, "seven_day_sonnet": None,
+            "extra_usage": {"is_enabled": True, "used_credits": 242, "monthly_limit": 200, "currency": "USD"},
+            "limits": [
+                {"kind": "session", "group": "session", "percent": 31, "scope": None},
+                {"kind": "weekly_all", "group": "weekly", "percent": 20, "scope": None},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 0, "resets_at": "2099-10-08T00:00:00Z",
+                 "scope": {"model": {"display_name": "Fable", "id": None}, "surface": None}},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 5,
+                 "scope": {"model": {"display_name": "Opus", "id": "claude-opus"}}},
+                {"kind": "weekly_scoped", "group": "monthly", "percent": 7, "resets_at": "not-a-date",
+                 "scope": {"model": {"display_name": None, "id": "model-x"}}},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": "bad", "scope": {"model": {"display_name": "Bad"}}},
+                {"kind": "weekly_scoped", "percent": 3, "scope": {"model": {}}},
+                "unexpected"],
+        })
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual([(w["label"], w["used_percent"], w.get("window_seconds"), w.get("scope"), w.get("window_id"))
+                          for w in result["windows"]], [
+            ("Current session", 31, 18000, "account", "five_hour"),
+            ("Current week", 20, 604800, "account", "seven_day"),
+            ("Opus week", 5, 604800, "opus", "seven_day_opus"),
+            ("Fable week", 0, 604800, "model:Fable", "weekly_scoped:Fable"),
+            ("model-x week", 7, None, "model:model-x", "weekly_scoped:model-x")])
+        self.assertIsNotNone(result["windows"][3]["resets_at"])
+        self.assertIsNone(result["windows"][4]["resets_at"])
+        self.assertEqual(result["details"], ["Extra usage: 242.00 / 200.00 USD"])
+
+    def test_local_claude_unsupported_limits_keep_account_windows(self):
+        for limits in ({"kind": "weekly_scoped"}, "bad", None):
+            with self.subTest(limits=limits):
+                result = self.claude({"five_hour": {"utilization": 1}, "limits": limits})
+                self.assertEqual([w["label"] for w in result["windows"]], ["Current session"])
+                self.assertEqual(result["windows"][0]["used_percent"], 1)
+
     def test_local_openrouter_balances_and_key_cap_are_unchanged(self):
         def get(url, *args, **kwargs):
             return {"data": {"total_credits": 100, "total_usage": 25} if url.endswith("credits")

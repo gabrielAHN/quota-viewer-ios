@@ -136,6 +136,16 @@ struct RenderingTest {
         self.assertEqual(rows[1]["text"][:2], ["gpt-reserve · Weekly", "Limit reached"])
         self.assertTrue(rows[1]["text"][2].startswith("Resets in "))
 
+    def test_claude_model_scoped_weekly_renders_readable_label(self):
+        session = dict(self.window("Current session", 69, seconds=18000), window_id="five_hour")
+        week = dict(self.window("Current week", 80), window_id="seven_day")
+        fable = dict(self.window("Fable week", 100, "model:Fable"), window_id="weekly_scoped:Fable")
+        rows = self.render([session, week, fable], "anthropic")
+        self.assertEqual([row["text"][:2] for row in rows], [
+            ["5h", "31% used · 69% left"], ["Weekly", "20% used · 80% left"], ["Fable · Weekly", "0% used · 100% left"]])
+        self.assertTrue(all(f["fits"] for row in rows for f in row["fields"]))
+        self.assertTrue(any("31% used" in f["text"] for f in rows[0]["header"]))
+
     def test_unknown_and_credit_windows_keep_text_only_rendering(self):
         credit = self.window("Account credits", 100)
         credit.update(remaining_amount=12.5, currency="USD")
