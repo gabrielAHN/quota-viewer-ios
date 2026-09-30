@@ -20,6 +20,7 @@ fi
 
 mkdir -p "$plugin_target/dashboard"
 install -m 644 "$service_home/plugin.yaml" "$plugin_target/plugin.yaml"
+install -m 644 "$service_home/__init__.py" "$plugin_target/__init__.py"
 install -m 644 "$service_home/dashboard/manifest.json" "$plugin_target/dashboard/manifest.json"
 install -m 644 "$service_home/dashboard/plugin_api.py" "$plugin_target/dashboard/plugin_api.py"
 install -m 644 "$service_home/dashboard/quota_metadata_compat.py" "$plugin_target/dashboard/quota_metadata_compat.py"
