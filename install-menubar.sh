@@ -38,6 +38,7 @@ mkdir -p "$app_target/Contents/MacOS" "$HOME/Library/LaunchAgents" "$HOME/.herme
 # gateway running, not just Hermes.
 install -m 755 "$service_home/desktop-quotas.sh" "$HOME/.local/bin/hermes-desktop-quotas"
 install -m 755 "$service_home/local-quotas.sh" "$HOME/.local/bin/hermes-local-quotas"
+install -m 755 "$service_home/provider-quotas.sh" "$HOME/.local/bin/provider-quotas"
 
 # Curated pets: Boba / Capy / Scoop from the petdex catalog into ~/.hermes/pets so
 # the menu offers them (shared with the Homebrew formula). Best-effort.
