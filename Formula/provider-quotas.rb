@@ -28,6 +28,7 @@ class ProviderQuotas < Formula
     # Data helpers the app shells out to (the app finds them here, on PATH).
     bin.install "desktop-quotas.sh" => "hermes-desktop-quotas"
     bin.install "local-quotas.sh" => "hermes-local-quotas"
+    bin.install "provider-quotas.sh" => "provider-quotas"
 
     # Shared pet bootstrap (run in post_install).
     libexec.install "bootstrap-pets.sh"
@@ -51,6 +52,9 @@ class ProviderQuotas < Formula
         brew services start provider-quotas
 
       Click the menu-bar icon, then turn on Hermes and/or Local under "Sources".
+      Debug from the terminal:
+        provider-quotas              (quotas as the menu reads them)
+        provider-quotas doctor       (install, service, sources, gateway, logs)
       Update later with:
         brew upgrade provider-quotas        (or the in-app "Check for Updates")
 
@@ -63,6 +67,7 @@ class ProviderQuotas < Formula
   test do
     assert_path_exists bin/"hermes-desktop-quotas"
     assert_path_exists bin/"hermes-local-quotas"
+    assert_match "usage: provider-quotas", shell_output("#{bin}/provider-quotas --help")
     assert_predicate prefix/"Provider Quotas.app/Contents/MacOS/ProviderQuotaMenuBar", :executable?
   end
 end

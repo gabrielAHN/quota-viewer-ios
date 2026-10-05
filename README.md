@@ -47,6 +47,7 @@ No automatic sign-in, credential repair, or Hermes restart is attempted.
 brew tap gabrielahn/quota https://github.com/gabrielAHN/quota-viewer-ios
 brew install --HEAD gabrielahn/quota/provider-quotas
 brew services start provider-quotas        # menu bar + run at login
+provider-quotas doctor                     # check the install from the terminal
 ```
 
 Update with `brew upgrade provider-quotas` (or the app's **Check for Updates**).
@@ -122,6 +123,24 @@ quota-cache refresh, without extra usage requests or changes to authentication.
 It runs only inside the fresh refresh subprocess, not as a permanent upstream
 plugin modification. Refreshes initiated outside this gateway plugin may still
 produce older metadata-free records; those receive the legacy display fallback.
+
+## Debugging from the terminal
+
+Both install paths put a `provider-quotas` CLI on your `PATH`. It runs the same
+helpers the menu runs, so what it prints is what the menu shows.
+
+```bash
+provider-quotas                  # quotas from the sources enabled in the menu
+provider-quotas --source all -v  # both sources, with scopes, fetch age and details
+provider-quotas --json           # raw helper payload
+provider-quotas doctor           # install, service, sources, gateway and recent logs
+provider-quotas logs             # recent menu-bar app logs
+```
+
+`status` exits `0` when every source reads, `2` when a source needs sign-in, and
+`1` for other failures. `doctor` exits `1` when it finds a problem. The CLI only
+reads: it never signs in, refreshes credentials, restarts services or forces a
+provider refresh.
 
 ## Configuring providers (gateway)
 
