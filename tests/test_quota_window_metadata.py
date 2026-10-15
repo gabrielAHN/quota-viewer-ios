@@ -1,6 +1,7 @@
 """Exercise reader transformations without credentials, network or cache writes."""
 import ast
 import copy
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -217,37 +218,66 @@ class LocalCodexWindowTests(unittest.TestCase):
                 self.assertEqual([w["label"] for w in result["windows"]], ["Current session"])
                 self.assertEqual(result["windows"][0]["used_percent"], 1)
 
-    def test_local_openrouter_balances_and_key_cap_are_unchanged(self):
+    def test_local_openrouter_shows_key_credits_left_and_account_balance(self):
         def get(url, *args, **kwargs):
             return {"data": {"total_credits": 100, "total_usage": 25} if url.endswith("credits")
-                    else {"limit": 20, "usage": 5}}
+                    else {"limit": 20, "limit_remaining": 15, "limit_reset": "monthly", "usage": 50,
+                          "usage_daily": 1.5, "usage_weekly": 3, "usage_monthly": 5}}
         with patch.dict(self.reader, {"_get": get, "UA": "test"}):
             result = self.reader["_openrouter_credits_provider"](
                 "openrouter", "OpenRouter", "test-key", "credits_api", "rejected")
-        credits, quota = result["windows"]
+        key, credits = result["windows"]
+        self.assertEqual(key["label"], "Key credits")
+        self.assertEqual(key["remaining_amount"], 15)
+        self.assertEqual(key["remaining_percent"], 75)
+        self.assertEqual(key["detail"], "$15.00 of $20.00 key limit")
+        reset = datetime.fromisoformat(key["resets_at"])
+        self.assertEqual((reset.day, reset.hour, reset.minute, reset.utcoffset()), (1, 0, 0, timedelta(0)))
+        self.assertGreater(reset, datetime.now(timezone.utc))
         self.assertEqual(credits["remaining_amount"], 75)
         self.assertEqual(credits["currency"], "USD")
-        self.assertEqual(quota["label"], "API key quota")
-        self.assertEqual(quota["remaining_percent"], 75)
+        self.assertEqual((credits["used_percent"], credits["remaining_percent"]), (25, 75))
+        self.assertEqual(credits["detail"], "$75.00 of $100.00 purchased")
+        self.assertEqual(result["details"], ["Spent today $1.50 · week $3.00 · month $5.00"])
         self.assertEqual([(w.get("scope"), w.get("window_id")) for w in result["windows"]],
-                         [("account", "account_credits"), ("api-key", "api_key_limit")])
+                         [("api-key", "api_key_limit"), ("account", "account_credits")])
         self.assertTrue(all(w.get("window_seconds") is None for w in result["windows"]))
+
+    def test_local_openrouter_legacy_key_without_remaining_uses_lifetime_cap(self):
+        def get(url, *args, **kwargs):
+            return {"data": {"total_credits": 100, "total_usage": 25} if url.endswith("credits")
+                    else {"limit": 20, "usage": 5, "limit_reset": None}}
+        with patch.dict(self.reader, {"_get": get, "UA": "test"}):
+            key, _ = self.reader["_openrouter_credits_provider"](
+                "openrouter", "OpenRouter", "test-key", "credits_api", "rejected")["windows"]
+        self.assertEqual(key["remaining_amount"], 15)
+        self.assertIsNone(key["resets_at"])
+
+    def test_local_openrouter_tighter_account_balance_leads(self):
+        def get(url, *args, **kwargs):
+            return {"data": {"total_credits": 10, "total_usage": 8} if url.endswith("credits")
+                    else {"limit": 20, "limit_remaining": 15, "limit_reset": "daily"}}
+        with patch.dict(self.reader, {"_get": get, "UA": "test"}):
+            result = self.reader["_openrouter_credits_provider"](
+                "openrouter", "OpenRouter", "test-key", "credits_api", "rejected")
+        self.assertEqual([w["label"] for w in result["windows"]], ["Account credits", "Key credits"])
 
     def test_opencode_uses_the_same_credit_metadata_without_changing_overage_math(self):
         def get(url, *args, **kwargs):
             return {"data": {"total_credits": 20, "total_usage": 25} if url.endswith("credits")
-                    else {"limit": 20, "usage": 25}}
+                    else {"limit": 20, "limit_remaining": -5, "usage": 25}}
         with patch.dict(self.reader, {"_get": get, "UA": "test", "_opencode_key": lambda: "test"}):
             result = self.reader["opencode_provider"]()
-        credits, quota = result["windows"]
+        quota, credits = result["windows"]
         self.assertEqual(result["provider"], "opencode")
         self.assertEqual(credits["remaining_amount"], 0)
-        self.assertIsNone(credits["used_percent"])
+        self.assertEqual(credits["used_percent"], 100)
         self.assertEqual(quota["used_percent"], 100)
         self.assertEqual(quota["remaining_percent"], 0)
+        self.assertEqual(quota["remaining_amount"], 0)
         self.assertTrue(all(w["warning"] for w in result["windows"]))
         self.assertEqual([(w.get("scope"), w.get("window_id")) for w in result["windows"]],
-                         [("account", "account_credits"), ("api-key", "api_key_limit")])
+                         [("api-key", "api_key_limit"), ("account", "account_credits")])
 
 
 class LocalAntigravityWindowTests(unittest.TestCase):
@@ -285,21 +315,49 @@ class LocalAntigravityWindowTests(unittest.TestCase):
                 self.assertEqual(payload, original)
 
 
+PLUGIN_NAMES = {"_adapt_record", "_openrouter_view", "_next_utc_reset", "_AUTH_REASONS", "_OR_KEY", "_OR_USD",
+                "_OR_NOISE", "_OR_SPEND", "_KNOWN_LABELS", "_DEFAULT_PROVIDERS", "_label_for",
+                "_hermes_providers", "_configured_providers"}
+
+
+def load_plugin(**stubs):
+    path = ROOT / "dashboard" / "plugin_api.py"
+    tree = ast.parse(path.read_text())
+    # The adapter is pure; avoid importing optional FastAPI/server dependencies.
+    tree.body = [node for node in tree.body if (
+        isinstance(node, ast.FunctionDef) and node.name in PLUGIN_NAMES) or (
+        isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and
+            t.id in PLUGIN_NAMES for t in node.targets))]
+    import os
+    import re
+    from typing import Any
+    namespace = {"os": os, "re": re, "Any": Any, "datetime": datetime, "timedelta": timedelta,
+                 "timezone": timezone, **stubs}
+    exec(compile(tree, str(path), "exec"), namespace)
+    return namespace
+
+
+OPENROUTER_RECORD = {
+    "label": "openrouter", "plan": None, "unavailable_reason": None,
+    "details": [
+        "Locally configured credentials: 1 (deduplicated); not an inventory of all account keys",
+        "Management API key listing not queried; credentials from Hermes native auth and saved pool only",
+        "Account wallet via Key 1 (native): USD 4.01 remaining (shared account credits, shown once; not summed across keys)",
+        "Account membership of other keys is unverified; wallet is not a total across accounts",
+        "Key 1 (native): key cap USD 40.00; remaining USD 3.61; resets monthly",
+        "Key 1 (native): usage total USD 55.5056",
+        "Key 1 (native): usage today UTC USD 9.2485",
+        "Key 1 (native): usage this week UTC USD 35.6715",
+        "Key 1 (native): usage this month UTC USD 36.3936",
+    ],
+    "windows": [{"label": "Key 1 (native) quota", "reset_at": None, "used_percent": 90.98404401}],
+}
+
+
 class OfficialCacheMetadataTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        path = ROOT / "dashboard" / "plugin_api.py"
-        tree = ast.parse(path.read_text())
-        # The adapter is pure; avoid importing optional FastAPI/server dependencies.
-        tree.body = [node for node in tree.body if (
-            isinstance(node, ast.FunctionDef) and node.name == "_adapt_record") or (
-            isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and
-                t.id == "_AUTH_REASONS" for t in node.targets))]
-        import re
-        from typing import Any
-        namespace = {"re": re, "Any": Any}
-        exec(compile(tree, str(path), "exec"), namespace)
-        cls.adapt = staticmethod(namespace["_adapt_record"])
+        cls.adapt = staticmethod(load_plugin()["_adapt_record"])
 
     def test_provider_agnostic_metadata_passes_through_without_mutation(self):
         for provider in ("openai-codex", "anthropic", "openrouter", "custom-provider"):
@@ -341,6 +399,105 @@ class OfficialCacheMetadataTests(unittest.TestCase):
         self.assertEqual(quota.get("scope"), "api-key")
         self.assertEqual(quota.get("window_seconds"), 86400)
         self.assertEqual(result["details"], [])
+
+    def test_openrouter_plugin_record_becomes_key_credits_left_and_account_balance(self):
+        record = copy.deepcopy(OPENROUTER_RECORD)
+        result = self.adapt("openrouter", "OpenRouter", record, None)
+        self.assertEqual(record, OPENROUTER_RECORD)
+        self.assertEqual(result["status"], "ok")
+        key, account = result["windows"]
+        self.assertEqual((key["label"], key["remaining_amount"], key["currency"]), ("Key credits", 3.61, "USD"))
+        self.assertAlmostEqual(key["remaining_percent"], 9.025, places=3)
+        self.assertEqual(key["detail"], "$3.61 of $40.00 key limit")
+        self.assertEqual((key["scope"], key["window_id"]), ("api-key", "api_key_limit"))
+        self.assertTrue(key["warning"])
+        reset = datetime.fromisoformat(key["resets_at"])
+        self.assertEqual((reset.day, reset.hour, reset.utcoffset()), (1, 0, timedelta(0)))
+        self.assertGreater(reset, datetime.now(timezone.utc))
+        self.assertEqual((account["label"], account["remaining_amount"], account["used_percent"]),
+                         ("Account credits", 4.01, None))
+        self.assertEqual(account["detail"], "Account balance shared by all keys")
+        self.assertEqual((account["scope"], account["window_id"]), ("account", "account_credits"))
+        self.assertEqual(result["details"], ["Spent today $9.25 · week $35.67 · month $36.39"])
+
+    def test_openrouter_purchased_total_gives_the_wallet_a_real_bar(self):
+        record = copy.deepcopy(OPENROUTER_RECORD)
+        record["details"].insert(3, "Account credits purchased: USD 80.00")
+        result = self.adapt("openrouter", "OpenRouter", record, None)
+        key, account = result["windows"]
+        self.assertEqual(account["remaining_amount"], 4.01)
+        self.assertAlmostEqual(account["remaining_percent"], 5.0125)
+        self.assertAlmostEqual(account["used_percent"], 94.9875)
+        self.assertEqual(account["detail"], "$4.01 of $80.00 purchased")
+        self.assertTrue(account["warning"])
+        self.assertNotIn("Account credits purchased: USD 80.00", result["details"])
+        record["details"][3] = "Account credits purchased: USD 0.00"
+        account = self.adapt("openrouter", "OpenRouter", record, None)["windows"][1]
+        self.assertIsNone(account["used_percent"])
+
+    def test_openrouter_tighter_wallet_leads_and_exhausted_cap_reads_zero(self):
+        record = copy.deepcopy(OPENROUTER_RECORD)
+        record["details"][2] = "Account wallet via Key 1 (native): USD 1.50 remaining (shared account credits)"
+        result = self.adapt("openrouter", "OpenRouter", record, None)
+        self.assertEqual([w["label"] for w in result["windows"]], ["Account credits", "Key credits"])
+        record["details"][4] = ("Key 1 (native): key cap USD 40.00; remaining USD -0.20 "
+                                "(key cap exhausted; account wallet is separate); resets weekly")
+        key = next(w for w in self.adapt("openrouter", "OpenRouter", record, None)["windows"] if w["label"] == "Key credits")
+        self.assertEqual((key["remaining_amount"], key["remaining_percent"]), (0.0, 0.0))
+        self.assertEqual(datetime.fromisoformat(key["resets_at"]).weekday(), 0)
+
+    def test_openrouter_uncapped_and_multiple_keys(self):
+        record = copy.deepcopy(OPENROUTER_RECORD)
+        record["details"][4] = "Key 1 (native): no key-specific cap (account wallet still applies)"
+        result = self.adapt("openrouter", "OpenRouter", dict(record, windows=[]), None)
+        account, = result["windows"]
+        self.assertEqual(account["detail"], "Account balance · key has no spending limit")
+        record = copy.deepcopy(OPENROUTER_RECORD)
+        record["details"] += ["Key 2 (saved): key cap USD 10.00; remaining USD 7.50; resets daily",
+                              "Key 2 (saved): unavailable (http-401)"]
+        result = self.adapt("openrouter", "OpenRouter", record, None)
+        self.assertEqual([(w["label"], w["window_id"]) for w in result["windows"]],
+                         [("Key 1 credits", "api_key_limit:1"), ("Key 2 credits", "api_key_limit:2"),
+                          ("Account credits", "account_credits")])
+        self.assertEqual(result["details"], ["Key 1 spent today $9.25 · week $35.67 · month $36.39",
+                                             "Key 2 (saved): unavailable (http-401)"])
+
+    def test_openrouter_unrecognised_details_are_left_alone(self):
+        record = {"details": ["Something new"], "windows": [{"label": "Key 1 (native) quota", "used_percent": 50}]}
+        result = self.adapt("openrouter", "OpenRouter", record, None)
+        self.assertEqual([w["label"] for w in result["windows"]], ["Key 1 (native) quota"])
+        self.assertEqual(result["details"], ["Something new"])
+
+
+class HermesProviderSetTests(unittest.TestCase):
+    def providers(self, cache, last_good=(), env=""):
+        plugin = load_plugin(_fresh_last_good=lambda slug: {} if slug in last_good else None,
+                             _read_official_cache=lambda: cache)
+        with patch.dict("os.environ", {"PROVIDER_QUOTA_PROVIDERS": env}):
+            return plugin["_configured_providers"](cache), plugin["_configured_providers"]()
+
+    def test_providers_follow_the_gateways_hermes_credentials(self):
+        cache = {"providers": {
+            "anthropic": {"unavailable_reason": None}, "copilot": {"unavailable_reason": None},
+            "cursor": {"unavailable_reason": "no-credentials"}, "grok": {"unavailable_reason": "opt-in-disabled"},
+            "nous": {"unavailable_reason": "not-logged-in"}, "openai-codex": {"unavailable_reason": None},
+            "openrouter": {"unavailable_reason": "fetch-error"}, "future-ai": {"unavailable_reason": None}}}
+        explicit, implicit = self.providers(cache)
+        self.assertEqual(explicit, implicit)
+        self.assertEqual(explicit, (("openrouter", "OpenRouter"), ("anthropic", "Claude"), ("openai-codex", "Codex"),
+                                    ("copilot", "Copilot"), ("future-ai", "Future Ai")))
+
+    def test_recent_good_reading_keeps_a_provider_through_a_credential_blip(self):
+        cache = {"providers": {"anthropic": {"unavailable_reason": "no-credentials"},
+                               "copilot": {"unavailable_reason": "no-credentials"}}}
+        self.assertEqual(self.providers(cache, last_good={"anthropic"})[0], (("anthropic", "Claude"),))
+
+    def test_missing_cache_falls_back_and_env_overrides(self):
+        default = (("openrouter", "OpenRouter"), ("anthropic", "Claude"), ("openai-codex", "Codex"))
+        self.assertEqual(self.providers({"fetched_at": None, "providers": {}})[0], default)
+        cache = {"providers": {"copilot": {"unavailable_reason": None}}}
+        self.assertEqual(self.providers(cache, env="anthropic=Claude Max, zai")[0],
+                         (("anthropic", "Claude Max"), ("zai", "Z.ai")))
 
 
 if __name__ == "__main__":

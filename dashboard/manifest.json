@@ -1,7 +1,7 @@
 {
   "name": "provider-quota",
   "label": "Provider Quotas",
-  "description": "Account-quota broker for your gateway's providers (configurable; defaults to OpenRouter, Claude, Codex)",
+  "description": "Account-quota broker for the providers your gateway's Hermes has credentials for",
   "icon": "Gauge",
   "version": "1.0.0",
   "tab": {

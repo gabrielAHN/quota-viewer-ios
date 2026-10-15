@@ -136,12 +136,17 @@ print(String(data: try JSONSerialization.data(withJSONObject: result), encoding:
         self.assertEqual(self.policy([self.window("Current week", 62)], "anthropic")["summary"], "Current week · 38% used · 62% left")
         self.assertEqual(self.policy([self.window("Budget", 62)], "unknown")["summary"], "Budget · 38% used · 62% left")
 
-    def test_credit_and_unknown_usage_never_get_percentage_bars(self):
+    def test_credits_get_a_bar_only_from_a_real_limit(self):
         for provider in ("openrouter", "opencode", "future-provider"):
-            result = self.policy([self.window("Account credits", 100, remaining_amount=12.5, currency="USD")], provider)
+            result = self.policy([self.window("Account credits", remaining_amount=12.5, currency="USD")], provider)
             self.assertIsNone(result["percent"])
             self.assertIn("12.50", result["summary"])
             self.assertNotIn("%", result["summary"])
+            capped = self.policy([self.window("Key credits", 9.0, remaining_amount=3.61, currency="USD", scope="api-key"),
+                                  self.window("Account credits", remaining_amount=4.01, currency="USD", scope="account")], provider)
+            self.assertEqual(capped["percent"], 9.0)
+            self.assertEqual(capped["summary"], "Key credits · $3.61 available")
+            self.assertFalse(capped["exhausted"])
         unknown = self.policy([self.window("Primary", scope="account"), self.window("Model cap", 80)])
         self.assertIsNone(unknown["percent"])
         self.assertEqual(unknown["summary"], "Primary · Usage unavailable")

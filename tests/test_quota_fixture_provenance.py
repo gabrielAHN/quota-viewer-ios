@@ -8,7 +8,8 @@ import unittest
 class QuotaFixtureProvenanceTests(unittest.TestCase):
     def test_fixture_definitions_match_verified_upstream_hashes(self):
         directory = pathlib.Path(__file__).parent / "fixtures"
-        for name in ("codex_upstream_provenance.json", "anthropic_upstream_provenance.json"):
+        for name in ("codex_upstream_provenance.json", "anthropic_upstream_provenance.json",
+                     "openrouter_upstream_provenance.json"):
             with self.subTest(provenance=name):
                 provenance = json.loads((directory / name).read_text())
                 source = (directory / provenance["fixture"]).read_text()

@@ -161,7 +161,7 @@ class DesktopAuthTests(unittest.TestCase):
         self.assertEqual(activity["sessions"][0]["providers"], ["openai-codex"])
         self.assertTrue(activity["status_busy"])
         self.assertEqual([r[1] for r in self.requests], [
-            "/api/plugins/provider-quota/activity", "/api/sessions",
+            "/api/plugins/provider-quota/activity", "/api/sessions?order=recent", "/api/sessions",
         ])
         self.assertEqual(self.token_file.read_bytes(), before)
 
@@ -179,6 +179,81 @@ class DesktopAuthTests(unittest.TestCase):
         result = self.run_reader("--activity")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["sessions"], [])
+
+    def write_connections(self, **registry):
+        (self.support / "connections.json").write_text(json.dumps({
+            "version": 2, "launchMode": "primary",
+            "connections": [{"id": "local", "kind": "local", "label": "This device"},
+                            {"id": "remote", "kind": "remote", "url": self.url, "authMode": "oauth"}],
+            **registry}))
+
+    def test_reads_the_gateway_even_when_this_device_is_primary_or_active(self):
+        for registry in ({"primary": "local", "lastUsed": "remote"},
+                         {"primary": "remote", "lastUsed": "local", "launchMode": "last-used"},
+                         {"primary": "local", "lastUsed": "local"}):
+            with self.subTest(registry=registry):
+                self.requests.clear()
+                self.write_connections(**registry)
+                result = self.run_reader()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("local", result.stderr)
+                self.assertEqual([r[:2] for r in self.requests], [("GET", "/api/plugins/provider-quota/quotas")])
+
+    def test_local_backend_is_only_read_without_a_gateway(self):
+        (self.support / "connections.json").write_text(json.dumps({
+            "version": 2, "primary": "local", "lastUsed": "local",
+            "connections": [{"id": "local", "kind": "local"}]}))
+        result = self.run_reader()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("local mode", result.stderr)
+        self.assertEqual(self.requests, [])
+        (self.support / "backend-ownership.json").write_text(json.dumps({"backends": [{"url": self.url}]}))
+        result = self.run_reader()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([r[:3] for r in self.requests], [("GET", "/api/plugins/provider-quota/quotas", None)])
+
+    def test_activity_finds_long_running_and_other_profile_gateway_sessions(self):
+        now = time.time()
+        store = {
+            "created": [{"id": "old-cron", "source": "cron", "is_active": False, "ended_at": now - 50,
+                         "last_active": now - 50, "model": "gpt-6.1-sol"}],
+            "recent": [{"id": "long-run", "source": "desktop", "is_active": True, "ended_at": None,
+                        "last_active": now - 5, "model": "gpt-6.1-sol"},
+                       {"id": "finished", "source": "desktop", "is_active": False, "ended_at": None,
+                        "last_active": now - 400, "model": "deepseek/deepseek-v4"}],
+        }
+        plugin = [{"session_id": "carto-turn", "surface": "tui", "model": "claude-opus-5-5", "is_active": True},
+                  {"session_id": "finished", "surface": "desktop", "model": "deepseek/deepseek-v4", "is_active": True}]
+
+        def respond(handler):
+            if handler.path == "/api/sessions?order=recent":
+                return 200, {"sessions": store["recent"]}
+            if handler.path == "/api/sessions":
+                return 200, {"sessions": store["created"]}
+            if handler.path == "/api/plugins/provider-quota/activity":
+                return 200, {"sessions": plugin}
+            return 404, {}
+        self.on_get = respond
+        result = self.run_reader("--activity")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sessions = json.loads(result.stdout)["sessions"]
+        self.assertEqual([s["providers"] for s in sessions], [["openai-codex"], ["anthropic"]])
+        self.assertTrue(json.loads(result.stdout)["status_busy"])
+
+    def test_activity_falls_back_when_gateway_rejects_recent_order(self):
+        now = time.time()
+
+        def respond(handler):
+            if handler.path == "/api/sessions?order=recent":
+                return 422, {}
+            if handler.path == "/api/sessions":
+                return 200, {"sessions": [{"id": "live", "is_active": True, "ended_at": None,
+                                           "last_active": now, "model": "claude-opus-5-5"}]}
+            return 404, {}
+        self.on_get = respond
+        result = self.run_reader("--activity")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([s["providers"] for s in json.loads(result.stdout)["sessions"]], [["anthropic"]])
 
     def test_confirmed_unauthorized_has_distinct_auth_exit_code(self):
         self.on_get = lambda handler: (401, {})

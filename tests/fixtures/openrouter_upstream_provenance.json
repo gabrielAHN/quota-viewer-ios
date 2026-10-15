@@ -1,0 +1,41 @@
+{
+  "source": "https://github.com/rarf/hermes-quota-plugin",
+  "fixture": "openrouter_upstream.py",
+  "definition_hash_method": "SHA-256 of ast.get_source_segment for each top-level definition (excluding decorators)",
+  "files": {
+    "quota_providers/base.py": {
+      "sha256": "9131d269a0339178fa262c49a77d7ff7ce7e92d7d314ad1d4fcfbee5591fb0b5",
+      "definitions": {
+        "NoRedirectHandler": "4d001289ecc62a15291d2c8a7892a345e44522d9c686545162ccd1141c7113b9",
+        "QuotaWindow": "fd6574f2a5b7ec4a734cbc03aff0940ed1dff6263e2de9b94b8d655d2851855c",
+        "AccountBalance": "c86b039ee3f88c21f3587286a7bcc04f8ed17e549ddc470cb6a54ffcc744dd4f",
+        "QuotaResult": "49b36b71d83d9b180d390631536013e9e4db7a6cd4fce11062dbc177e74b73fe",
+        "build_unavailable": "b75fc223ffdc5b4ac0ab3c90563e0ee9ce567fcbbccbbedb3cfa500ae06a707c"
+      }
+    },
+    "quota_providers/registry.py": {
+      "sha256": "4200f9435820b6936b07ffaa2fe5b482dbee9b685d51c73aa851ccea403a1ce0",
+      "definitions": {
+        "register": "e30935299986bf6d71f31774dfec005d49e781f24b186f6ba3a2280d3d4a393d"
+      }
+    },
+    "quota_providers/openrouter.py": {
+      "sha256": "4ce3d2ddd673ddcbec2fac974f9806531bf0ea3e21b11933ca29076b3a1c4666",
+      "definitions": {
+        "_env_value": "81fe5e2e5442ee26f683b481dd5ad4c0f19f5c862d874150ee7d07a2bdb2d9e8",
+        "_resolve_credentials": "8ea40479a6c9b3939c98d0c97552de2e41babe3b82946b76c9f86148ba94cb02",
+        "_get_json": "f15026fd352d9ab9d44d3cc23f65bee2bd1b9b70c5103e8a56141a5c5cdb0d95",
+        "_amount": "067d20455e2e3cece435f96677767899fa99537eaa0e945b35e397c6458d85ef",
+        "_key_result": "8c7cda3a17bc65e7fc4327f0e4f42d3134db239df7ad324efa679aa36c1464d2",
+        "_wallet_result": "80faf9a681700f70d1a4c77664557b7f6b57512b8638b64074e86a96682da8c6",
+        "fetch_openrouter_quota": "d0a0729c76f4e49d0dce2dd72259792c54dc69f838b946f1c0b71062e2584443"
+      }
+    },
+    "quota_cache.py": {
+      "sha256": "1bc2b3c2f984db8c208a56b4aff8aea04ded962bfc0d062c9af8ddf4e39315d2",
+      "definitions": {
+        "_result_to_record": "f01844b98e8fe4bae2010a855634d73ab66420f307ed23a9bbd0036c0058c6c2"
+      }
+    }
+  }
+}

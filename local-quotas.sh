@@ -527,6 +527,17 @@ def _openrouter_key():
     return None
 
 
+def _openrouter_next_reset(period):
+    midnight = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    if period == "daily":
+        return (midnight + timedelta(days=1)).isoformat()
+    if period == "weekly":
+        return (midnight + timedelta(days=7 - midnight.weekday())).isoformat()
+    if period == "monthly":
+        return (midnight.replace(day=1) + timedelta(days=32)).replace(day=1).isoformat()
+    return None
+
+
 # Shared credits-API fetch: one OpenRouter-shaped row per credential holder, so
 # the env/~/.hermes key (provider "openrouter") and opencode's own key
 # (provider "opencode") each get their own row, the way the Hermes source lists
@@ -544,23 +555,37 @@ def _openrouter_credits_provider(slug, label, key, source, reject_message):
     total = float(credits.get("total_credits") or 0.0)
     usage = float(credits.get("total_usage") or 0.0)
     remaining = max(0.0, total - usage)
-    windows = [_window("Account credits", None, remaining_amount=remaining, currency="USD",
-                       detail=f"${remaining:.2f} of ${total:.2f} left" if total > 0 else f"${remaining:.2f} available")]
-    # Match the Hermes source, which lists an "API key quota" % window (the per-key
-    # spend limit) alongside the credit balance. OpenRouter's /api/v1/key returns
-    # the key's `limit` + `usage`; a null limit means "no cap" so we skip the window.
+    account = _window("Account credits", usage / total * 100.0 if total > 0 else None,
+                      remaining_amount=remaining, currency="USD",
+                      detail=f"${remaining:.2f} of ${total:.2f} purchased" if total > 0 else "Account balance shared by all keys")
+    account.update(scope="account", window_id="account_credits")
+    windows, details = [], []
     try:
         kd = (_get("https://openrouter.ai/api/v1/key", headers, timeout=10).get("data") or {})
-        klimit, kusage = kd.get("limit"), kd.get("usage")
-        if isinstance(klimit, (int, float)) and klimit > 0 and isinstance(kusage, (int, float)):
-            used = min(100.0, max(0.0, kusage / klimit * 100.0))
-            windows.append(_window("API key quota", used,
-                                   detail=f"${max(0.0, klimit - kusage):.2f} of ${klimit:.2f} key limit left"))
+        number = lambda value: isinstance(value, (int, float)) and not isinstance(value, bool)
+        klimit, kleft = kd.get("limit"), kd.get("limit_remaining")
+        if number(klimit) and klimit > 0:
+            if not number(kleft) and number(kd.get("usage")) and not kd.get("limit_reset"):
+                kleft = klimit - kd["usage"]
+            if number(kleft):
+                kleft = max(0.0, float(kleft))
+                window = _window("Key credits", (klimit - kleft) / klimit * 100.0,
+                                 resets_at=_openrouter_next_reset(kd.get("limit_reset")),
+                                 remaining_amount=kleft, currency="USD",
+                                 detail=f"${kleft:.2f} of ${klimit:.2f} key limit")
+                window.update(scope="api-key", window_id="api_key_limit")
+                windows.append(window)
+        spent = [f"{name} ${kd[field]:.2f}" for field, name in (
+            ("usage_daily", "today"), ("usage_weekly", "week"), ("usage_monthly", "month")) if number(kd.get(field))]
+        if spent:
+            details.append("Spent " + " · ".join(spent))
     except Exception:
         pass
-    for window, window_id in zip(windows, ("account_credits", "api_key_limit")):
-        window.update(scope="account" if window_id == "account_credits" else "api-key", window_id=window_id)
-    return _provider(slug, label, "ok", windows, source=source)
+    if windows and remaining < windows[0]["remaining_amount"]:
+        windows.insert(0, account)
+    else:
+        windows.append(account)
+    return _provider(slug, label, "ok", windows, source=source, details=details)
 
 
 def openrouter_provider():

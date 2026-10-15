@@ -83,22 +83,73 @@ def http_get(url, headers):
         fail("Cannot reach Hermes gateway: %s" % exc)
 
 
-# --- Which gateway is the Desktop bound to? Prefer the primary entry in the v2
-# connections.json, fall back to the legacy connection.json. Wrapped so that in
-# --activity mode a broken/absent primary doesn't abort — fetch stays None and the
-# scan proceeds with the local Desktop-spawned backend only. ---
+def _spawned_local_backend():
+    """(base_url, headers) for the LOCAL `hermes serve` backend the Desktop spawned,
+    or None. Its REST token is not on disk — Electron mints it in memory and hands
+    it to `serve` as HERMES_DASHBOARD_SESSION_TOKEN — so resolve everything live:
+    backend pid (from backend-ownership.json) -> its listening loopback port (lsof;
+    serve runs with --port 0) -> the token from that process's OWN environment.
+    This is the macOS path (ps eww / lsof over our own uid)."""
+    import re
+    own = read_json("backend-ownership.json") or {}
+    for backend in own.get("backends") or []:
+        pid = backend.get("pid")
+        base = (backend.get("url") or backend.get("baseUrl") or "").rstrip("/")
+        if not base:
+            port = backend.get("port")
+            if not port and isinstance(pid, int) and pid > 0:
+                try:
+                    listing = subprocess.run(
+                        ["/usr/sbin/lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", str(pid)],
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3,
+                    ).stdout.decode("utf-8", "replace")
+                    m = re.search(r"127\.0\.0\.1:(\d+)", listing)
+                    port = m.group(1) if m else None
+                except Exception:
+                    port = None
+            if not port:
+                continue
+            base = "http://127.0.0.1:%s" % port
+        headers = {"Accept": "*/*"}
+        if isinstance(pid, int) and pid > 0:
+            try:
+                env = subprocess.run(
+                    ["ps", "eww", "-p", str(pid)],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3,
+                ).stdout.decode("utf-8", "replace")
+                m = re.search(r"HERMES_DASHBOARD_SESSION_TOKEN=(\S+)", env)
+                if m:
+                    headers["X-Hermes-Session-Token"] = m.group(1)
+            except Exception:
+                pass
+        return base, headers
+    return None
+
+
+def gateway_connection(conns):
+    entries = [c for c in (conns.get("connections") or []) if isinstance(c, dict)]
+    by_id = {c.get("id"): c for c in entries}
+    ordered = [c for c in (by_id.get(conns.get("lastUsed")), by_id.get(conns.get("primary"))) if c] + entries
+    remote = next((c for c in ordered if c.get("kind") != "local" and c.get("url")), None)
+    return remote or (ordered[0] if ordered else None)
+
+
+# --- Which gateway does the Hermes source read? A configured GATEWAY connection
+# (remote/cloud with a URL) wins over "This device" — the connection the Desktop is
+# on (`lastUsed`), then its `primary`, then any other — because the Desktop flips
+# `lastUsed` to the local backend whenever a window uses it, and that must not turn
+# the gateway's quotas into a local-instance check. Only a registry with no gateway
+# reads the local backend; the legacy connection.json is the last fallback. Wrapped
+# so that in --activity mode a broken/absent connection doesn't abort — fetch stays
+# None and the scan proceeds with the local Desktop-spawned backend only. ---
 fetch = None
 EXPIRED_MSG = "Hermes gateway returned HTTP %s."
 try:
-    conns = read_json("connections.json") or {}
-    primary = None
-    if isinstance(conns.get("connections"), list) and conns["connections"]:
-        by_id = {c.get("id"): c for c in conns["connections"]}
-        primary = by_id.get(conns.get("primary")) or conns["connections"][0]
+    active = gateway_connection(read_json("connections.json") or {})
 
-    if primary is not None:
-        kind = primary.get("kind")
-        url = (primary.get("url") or "").rstrip("/")
+    if isinstance(active, dict):
+        kind = active.get("kind")
+        url = (active.get("url") or "").rstrip("/")
     else:
         legacy = read_json("connection.json") or {}
         kind = legacy.get("mode")
@@ -113,26 +164,18 @@ try:
         return value.strip().strip("/")
 
     # --- Build a `fetch(path) -> (status, body)` bound to the gateway the Desktop is
-    # bound to: a loopback bind (local mode) needs no auth; a remote gateway uses the
-    # Desktop's OAuth session. Resolving this once lets one process serve several
-    # endpoints (see --activity) with a single Keychain read / token decrypt. ---
+    # bound to: the Desktop-spawned local backend (local mode) authenticates with its
+    # session token; a remote gateway uses the Desktop's OAuth session. Resolving
+    # this once lets one process serve several endpoints (see --activity) with a
+    # single Keychain read / token decrypt. ---
     if kind == "local":
-        own = read_json("backend-ownership.json") or {}
-        local_url = None
-        for backend in own.get("backends") or []:
-            candidate = (backend.get("url") or backend.get("baseUrl") or "").rstrip("/")
-            if candidate:
-                local_url = candidate
-                break
-            port = backend.get("port")
-            if port:
-                local_url = "http://127.0.0.1:%s" % port
-                break
-        if not local_url:
+        local = _spawned_local_backend()
+        if not local:
             fail("Hermes Desktop is in local mode but no local gateway is running.")
+        local_url, local_headers = local
 
         def fetch(path):
-            return http_get(local_url + path, {"Accept": "*/*"})
+            return http_get(local_url + path, local_headers)
 
         EXPIRED_MSG = "Local Hermes gateway returned HTTP %s."
     else:
@@ -215,7 +258,7 @@ def get_json(path):
         fetch = None
         return None
     if status != 200:
-        if status != 404:
+        if status not in (400, 404, 422):
             fetch = None
         return None
     try:
@@ -227,62 +270,26 @@ def get_json(path):
 
 def _spawned_local_backend_get_json():
     """A get_json bound to the LOCAL `hermes serve` backend the Desktop spawned, if
-    one is running — INDEPENDENT of which connection is the Desktop's PRIMARY. A
+    one is running — INDEPENDENT of which connection the Hermes source reads. A
     Desktop chat runs on that local backend (source: desktop), so the Hermes pet has
-    to read it even when the primary connection is a REMOTE gateway whose
-    /api/sessions never lists this machine's desktop sessions. The backend's REST
-    token is not on disk — Electron mints it in memory and hands it to `serve` as
-    HERMES_DASHBOARD_SESSION_TOKEN — so resolve everything live: backend pid (from
-    backend-ownership.json) -> its listening loopback port (lsof; serve runs with
-    --port 0) -> the token from that process's OWN environment. Returns None when no
-    local backend is running or its port/token can't be resolved. This is the macOS
-    path (ps eww / lsof over our own uid); a client with only a remote gateway and no
-    local spawn simply gets None and nothing changes."""
-    import re
-    own = read_json("backend-ownership.json") or {}
-    for backend in own.get("backends") or []:
-        pid = backend.get("pid")
-        if not isinstance(pid, int) or pid <= 0:
-            continue
-        base = (backend.get("url") or backend.get("baseUrl") or "").rstrip("/")
-        if not base:
-            port = backend.get("port")
-            if not port:
-                try:
-                    listing = subprocess.run(
-                        ["/usr/sbin/lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", str(pid)],
-                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3,
-                    ).stdout.decode("utf-8", "replace")
-                    m = re.search(r"127\.0\.0\.1:(\d+)", listing)
-                    port = m.group(1) if m else None
-                except Exception:
-                    port = None
-            if not port:
-                continue
-            base = "http://127.0.0.1:%s" % port
-        token = None
+    to read it even when the source reads a REMOTE gateway whose /api/sessions never
+    lists this machine's desktop sessions. Returns None when no local backend is
+    running or its port can't be resolved; a client with only a remote gateway and
+    no local spawn simply gets None and nothing changes."""
+    local = _spawned_local_backend()
+    if local is None:
+        return None
+    base, headers = local
+
+    def _get(path):
+        status, body = http_get(base + path, headers)
+        if status != 200:
+            return None
         try:
-            env = subprocess.run(
-                ["ps", "eww", "-p", str(pid)],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3,
-            ).stdout.decode("utf-8", "replace")
-            m = re.search(r"HERMES_DASHBOARD_SESSION_TOKEN=(\S+)", env)
-            token = m.group(1) if m else None
+            return json.loads(body)
         except Exception:
-            token = None
-        headers = {"Accept": "*/*"}
-        if token:
-            headers["X-Hermes-Session-Token"] = token
-        def _get(path, _base=base, _headers=headers):
-            status, body = http_get(_base + path, _headers)
-            if status != 200:
-                return None
-            try:
-                return json.loads(body)
-            except Exception:
-                return None
-        return _get
-    return None
+            return None
+    return _get
 
 
 # --- Activity mode: resolve the gateway ONCE, then fetch /api/status plus each
@@ -388,11 +395,14 @@ if ENDPOINT == "--activity":
             elif _more_alive(_s, cur):
                 best_by_id[_sid] = _s
 
+    def _recent_sessions(getter):
+        return _soft(getter)("/api/sessions?order=recent") or _soft(getter)("/api/sessions")
+
     try:
-        _ingest(_soft(get_json)("/api/sessions"))
+        _ingest(_recent_sessions(get_json))
         _local_get = _spawned_local_backend_get_json()
         if _local_get is not None:
-            _ingest(_soft(_local_get)("/api/sessions"))
+            _ingest(_recent_sessions(_local_get))
             # If the primary's plugin /activity came back empty (typical when the
             # primary is a remote gateway but the live sessions are local), let the
             # local backend's /activity be the fallback list too.
@@ -487,10 +497,12 @@ if ENDPOINT == "--activity":
         return bool(la) and (now - la) <= _FRESH
 
     store_list = _sess.get("sessions") if isinstance(_sess, dict) else None
+    plugin_live = [s for s in (act.get("sessions") or []) if s.get("is_active")]
     if store_list:
         candidates = [s for s in store_list if s.get("ended_at") is None and _live(s)]
+        candidates += [s for s in plugin_live if str(s.get("session_id") or "") not in store_by_id]
     else:
-        candidates = [s for s in (act.get("sessions") or []) if s.get("is_active")]
+        candidates = plugin_live
 
     for s in candidates:
         att = _attention(s)
