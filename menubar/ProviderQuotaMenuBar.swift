@@ -1650,6 +1650,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if !expanded && connected && provider.status == "ok", let window = collapsedWindow(provider) {
             let reset = preciseCountdown(window.resetsAt).map { "Resets in \($0)" }
+                ?? (window.remainingAmount != nil ? window.detail : nil)
                 ?? "No reset time reported"
             view.addSubview(label(reset, frame: NSRect(x: 70, y: 2, width: barWillShow ? 156 : 266, height: 14), font: .systemFont(ofSize: 9.5), color: menuSecondaryColor()))
         }
@@ -1852,7 +1853,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func windowShowsBar(_ window: QuotaWindow, provider: QuotaProvider) -> Bool {
-        guard window.remainingAmount == nil, window.remainingPercent != nil else { return false }
+        guard window.remainingPercent != nil else { return false }
         if Self.normalizedProvider(provider.provider) == "openai-codex",
            let scope = window.scope, !scope.isEmpty, !["account", "api-key"].contains(scope),
            !applicableWindows(provider).isEmpty {
@@ -1873,7 +1874,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func collapsedRemainingPercent(_ provider: QuotaProvider) -> Double? {
-        guard let window = collapsedWindow(provider), window.remainingAmount == nil else { return nil }
+        guard let window = collapsedWindow(provider) else { return nil }
         return window.remainingPercent
     }
 
@@ -2291,7 +2292,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             view.addSubview(track)
         }
         let subtitle: String
-        if let reset = formattedReset(window.resetsAt) {
+        if window.remainingAmount != nil, let detail = window.detail, let countdown = preciseCountdown(window.resetsAt) {
+            subtitle = "\(detail) · resets in \(countdown)"
+        } else if let reset = formattedReset(window.resetsAt) {
             subtitle = "Resets \(reset)"
         } else if let detail = window.detail {
             subtitle = detail
@@ -4222,20 +4225,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let provider = values["hermes.desktop.composer.provider"]
         let model = values["hermes.desktop.composer.model"]
 
-        // Adopt whichever gateway THIS Desktop is bound to, from its own config —
-        // prefer the v2 connections.json ({primary, connections:[{kind,url}]}),
-        // fall back to the legacy connection.json — exactly like the quota helper,
-        // so ANY Hermes Desktop setup works, not one specific machine/gateway.
+        // Adopt the gateway the Hermes source reads, from the Desktop's own config —
+        // a configured remote connection in the v2 connections.json (the one it is
+        // on, then its primary, then any) wins over "This device"; only a registry
+        // with no gateway reads the local backend; the legacy connection.json is the
+        // last fallback — exactly like the quota helper.
         if let data = try? Data(contentsOf: support.appendingPathComponent("connections.json")),
            let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let list = root["connections"] as? [[String: Any]], !list.isEmpty {
-            let primaryID = root["primary"] as? String
-            let primary = list.first { ($0["id"] as? String) == primaryID } ?? list[0]
-            if (primary["kind"] as? String) == "local" {
+           let active = gatewayConnection(in: root) {
+            if (active["kind"] as? String) == "local" {
                 return DesktopStatus(running: running, mode: "local", authMode: "local", remoteURL: nil, signedIn: true, reachable: running, profile: profile, provider: provider, model: model)
             }
-            let remoteURL = primary["url"] as? String
-            let authMode = (primary["authMode"] as? String) ?? "oauth"
+            let remoteURL = active["url"] as? String
+            let authMode = (active["authMode"] as? String) ?? "oauth"
             let signedIn = remoteURL.map { hasNativeOAuthSession(for: $0, support: support) } ?? false
             let reachable = remoteURL.map { gatewayIsReachable($0) } ?? false
             return DesktopStatus(running: running, mode: "remote", authMode: authMode, remoteURL: remoteURL, signedIn: signedIn, reachable: reachable, profile: profile, provider: provider, model: model)
@@ -4268,6 +4270,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let reachable = remoteURL.map { gatewayIsReachable($0) } ?? (mode == "ssh" && signedIn)
         return DesktopStatus(running: running, mode: mode, authMode: authMode, remoteURL: remoteURL, signedIn: signedIn, reachable: reachable, profile: profile, provider: provider, model: model)
+    }
+
+    static func gatewayConnection(in root: [String: Any]) -> [String: Any]? {
+        guard let list = root["connections"] as? [[String: Any]], !list.isEmpty else { return nil }
+        func entry(_ key: String) -> [String: Any]? {
+            guard let id = root[key] as? String else { return nil }
+            return list.first { ($0["id"] as? String) == id }
+        }
+        let ordered = [entry("lastUsed"), entry("primary")].compactMap { $0 } + list
+        return ordered.first { ($0["kind"] as? String) != "local" && !(($0["url"] as? String) ?? "").isEmpty } ?? ordered[0]
     }
 
     private static func readDesktopStorage(at directory: URL) -> [String: String] {

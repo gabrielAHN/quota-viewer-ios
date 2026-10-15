@@ -1,4 +1,5 @@
-"""Process-local bridge for the official quota plugin's Codex and Claude windows.
+"""Process-local bridge for the official quota plugin's Codex and Claude windows and
+OpenRouter's purchased-credits total.
 
 Install only inside the existing short-lived refresh subprocess. Observe JSON
 already fetched by each provider; never fetch, renew credentials, or patch upstream
@@ -7,6 +8,7 @@ files. Unsupported response/model/serializer shapes leave the official result un
 from dataclasses import fields, is_dataclass, make_dataclass, replace
 from datetime import datetime, timezone
 from functools import wraps
+import inspect
 import math
 import threading
 from urllib.parse import urlsplit
@@ -195,15 +197,75 @@ def _enrich(result, rows):
                                     for window, (_, label, metadata) in zip(result.windows, rows)])
 
 
+def _enrich_openrouter(result, totals):
+    if result is None or result.label != 'openrouter' or result.unavailable_reason or len(totals) != 1 or totals[0] is None:
+        return result
+    details = list(result.details or [])
+    wallets = [i for i, line in enumerate(details) if isinstance(line, str) and line.startswith('Account wallet via ')]
+    if len(wallets) != 1:
+        return result
+    details.insert(wallets[0] + 1, f'Account credits purchased: USD {totals[0]:.2f}')
+    return replace(result, details=details)
+
+
+def _install_openrouter(registry):
+    fetch = registry.get('openrouter')
+    scope = getattr(inspect.unwrap(fetch), '__globals__', None) if callable(fetch) else None
+    get_json = scope.get('_get_json') if isinstance(scope, dict) else None
+    if not callable(fetch) or not callable(get_json) or getattr(fetch, '_quota_credits_compat', False):
+        return False
+    seen = {'active': False, 'totals': []}
+
+    @wraps(get_json)
+    def observed_get_json(url, *args, **kwargs):
+        result = get_json(url, *args, **kwargs)
+        if seen['active']:
+            try:
+                parts = urlsplit(str(url))
+                if (parts.scheme, parts.hostname, parts.path) == ('https', 'openrouter.ai', '/api/v1/credits'):
+                    payload, error = result
+                    data = payload.get('data') if isinstance(payload, dict) else None
+                    total = data.get('total_credits') if isinstance(data, dict) else None
+                    seen['totals'].append(float(total) if not error and _number(total) and total > 0 else None)
+            except Exception:
+                seen['totals'].append(None)
+        return result
+
+    @wraps(fetch)
+    def fetch_with_credits(*args, **kwargs):
+        seen['active'], seen['totals'] = True, []
+        try:
+            result = fetch(*args, **kwargs)
+        finally:
+            seen['active'] = False
+        totals, seen['totals'] = seen['totals'], []
+        try:
+            return _enrich_openrouter(result, totals)
+        except Exception:
+            return result
+
+    fetch_with_credits._quota_credits_compat = True
+    scope['_get_json'] = observed_get_json
+    registry['openrouter'] = fetch_with_credits
+    return True
+
+
 def install(cache=None, httpx_module=None):
     """Install once; False means an unsupported seam (official refresh still runs)."""
     try:
         if cache is None:
             from quota import quota_cache as cache
-        if httpx_module is None:
-            import httpx as httpx_module
         if getattr(cache, '_quota_metadata_compat_installed', False):
             return True
+    except Exception:
+        return False
+    try:
+        _install_openrouter(cache.PROVIDER_FETCHERS)
+    except Exception:
+        pass
+    try:
+        if httpx_module is None:
+            import httpx as httpx_module
         registry = cache.PROVIDER_FETCHERS
         fetchers = {pid: registry[pid] for pid in _PROVIDERS if callable(registry.get(pid))}
         serialize = cache._result_to_record

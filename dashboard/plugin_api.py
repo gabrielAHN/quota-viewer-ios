@@ -6,7 +6,7 @@ import re
 import socket
 import time
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Annotated, Any
@@ -15,12 +15,24 @@ from fastapi import APIRouter, Query, Response
 
 router = APIRouter()
 
-# Nice labels for the providers Hermes ships account-usage support for. Any other
-# slug still works — it just gets a title-cased label.
+# Nice labels for the providers the quota plugin reports. Any other slug still
+# works — it just gets a title-cased label. Order here is the menu order.
 _KNOWN_LABELS = {
     "openrouter": "OpenRouter",
     "anthropic": "Claude",
     "openai-codex": "Codex",
+    "copilot": "Copilot",
+    "nous": "Nous",
+    "gemini": "Gemini",
+    "antigravity": "Antigravity",
+    "grok": "Grok",
+    "deepseek": "DeepSeek",
+    "kimi": "Kimi",
+    "minimax": "MiniMax",
+    "zai": "Z.ai",
+    "opencode-go": "OpenCode Go",
+    "cursor": "Cursor",
+    "commandcode": "Command Code",
 }
 _DEFAULT_PROVIDERS = "openrouter,anthropic,openai-codex"
 
@@ -29,17 +41,34 @@ def _label_for(slug: str) -> str:
     return _KNOWN_LABELS.get(slug, slug.replace("-", " ").replace("_", " ").title())
 
 
-def _configured_providers() -> tuple[tuple[str, str], ...]:
+def _hermes_providers(cache: dict[str, Any]) -> str:
+    records = cache.get("providers") if isinstance(cache, dict) else None
+    if not isinstance(records, dict):
+        return ""
+    slugs = [
+        slug for slug, rec in records.items()
+        if isinstance(rec, dict) and (
+            rec.get("unavailable_reason") not in _AUTH_REASONS or _fresh_last_good(slug) is not None)
+    ]
+    order = list(_KNOWN_LABELS)
+    slugs.sort(key=lambda slug: (order.index(slug) if slug in order else len(order), slug))
+    return ",".join(slugs)
+
+
+def _configured_providers(cache: dict[str, Any] | None = None) -> tuple[tuple[str, str], ...]:
     """Which providers this gateway's dashboard reports on.
 
-    Configurable per gateway via the ``PROVIDER_QUOTA_PROVIDERS`` env var
-    (comma-separated ``slug`` or ``slug=Label`` items), so anyone can reuse this
-    plugin with their own gateway's provider set instead of a hardcoded list.
-    Defaults to the providers Hermes ships usage support for. Whatever the set,
-    every quota is read through this gateway's own ``account_usage`` credentials,
-    so the plugin stays linked to the gateway it's installed in.
+    By default, the providers Hermes on this gateway actually has credentials
+    for — every provider in the quota plugin's cache that is not reported as
+    no-credentials / not-logged-in / opt-in-disabled (or still has a recent good
+    reading). ``PROVIDER_QUOTA_PROVIDERS`` (comma-separated ``slug`` or
+    ``slug=Label`` items) overrides that set explicitly. Every quota is read
+    through this gateway's own credentials, so the plugin stays linked to the
+    gateway it's installed in.
     """
-    raw = os.environ.get("PROVIDER_QUOTA_PROVIDERS", "").strip() or _DEFAULT_PROVIDERS
+    raw = os.environ.get("PROVIDER_QUOTA_PROVIDERS", "").strip()
+    if not raw:
+        raw = _hermes_providers(_read_official_cache() if cache is None else cache) or _DEFAULT_PROVIDERS
     providers: list[tuple[str, str]] = []
     seen: set[str] = set()
     for item in raw.split(","):
@@ -185,6 +214,115 @@ def _refresh_official_cache() -> None:
         pass
 
 
+def _next_utc_reset(period: str | None, now: datetime | None = None) -> str | None:
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if period == "daily":
+        return (midnight + timedelta(days=1)).isoformat()
+    if period == "weekly":
+        return (midnight + timedelta(days=7 - midnight.weekday())).isoformat()
+    if period == "monthly":
+        return (midnight.replace(day=1) + timedelta(days=32)).replace(day=1).isoformat()
+    return None
+
+
+_OR_KEY = r"(Key (\d+) \([^)]*\))"
+_OR_USD = r"(-?[0-9]+(?:\.[0-9]+)?)"
+_OR_NOISE = ("Locally configured credentials", "Management API key listing", "Account membership of other keys")
+_OR_SPEND = (("today UTC", "today"), ("this week UTC", "week"), ("this month UTC", "month"))
+
+
+def _openrouter_view(windows: list[dict[str, Any]], details: list[str]) -> tuple[list[dict[str, Any]], list[str]]:
+    keys: dict[str, dict[str, Any]] = {}
+    wallet = None
+    purchased = None
+    rest: list[str] = []
+    for line in details:
+        if line.startswith(_OR_NOISE):
+            continue
+        match = re.match(r"Account credits purchased: USD " + _OR_USD, line)
+        if match:
+            purchased = float(match.group(1))
+            continue
+        match = re.match(_OR_KEY + r": key cap USD " + _OR_USD, line)
+        if match:
+            key = keys.setdefault(match.group(1), {"n": match.group(2)})
+            key["limit"] = float(match.group(3))
+            left = re.search(r"; remaining USD " + _OR_USD, line)
+            if left:
+                key["left"] = float(left.group(1))
+            reset = re.search(r"; resets (daily|weekly|monthly)\b", line)
+            key["reset"] = reset.group(1) if reset else None
+            continue
+        match = re.match(_OR_KEY + r": no key-specific cap", line)
+        if match:
+            keys.setdefault(match.group(1), {"n": match.group(2)})["uncapped"] = True
+            continue
+        match = re.match(r"Account wallet via " + _OR_KEY + r": USD " + _OR_USD + r" remaining", line)
+        if match:
+            wallet = float(match.group(3))
+            continue
+        match = re.match(_OR_KEY + r": usage (total|today UTC|this week UTC|this month UTC) USD " + _OR_USD, line)
+        if match:
+            keys.setdefault(match.group(1), {"n": match.group(2)}).setdefault("usage", {})[match.group(3)] = float(match.group(4))
+            continue
+        rest.append(line)
+    if not keys and wallet is None:
+        return windows, details
+
+    single = len(keys) <= 1
+    credits: list[dict[str, Any]] = []
+    replaced: set[str] = set()
+    spend: list[str] = []
+    for name, key in keys.items():
+        limit, left = key.get("limit"), key.get("left")
+        if limit and limit > 0 and left is not None:
+            left = max(0.0, left)
+            used = max(0.0, min(100.0, (limit - left) / limit * 100.0))
+            credits.append({
+                "label": "Key credits" if single else f"Key {key['n']} credits",
+                "used_percent": used,
+                "remaining_percent": 100.0 - used,
+                "remaining_amount": left,
+                "currency": "USD",
+                "resets_at": _next_utc_reset(key.get("reset")),
+                "detail": f"${left:.2f} of ${limit:.2f} key limit",
+                "warning": used >= 85.0,
+                "scope": "api-key",
+                "window_id": "api_key_limit" if single else f"api_key_limit:{key['n']}",
+            })
+            replaced.add(f"{name} quota")
+        usage = key.get("usage") or {}
+        parts = [f"{label} ${usage[field]:.2f}" for field, label in _OR_SPEND if field in usage]
+        if parts:
+            spend.append(("Spent " if single else f"Key {key['n']} spent ") + " · ".join(parts))
+    if wallet is not None:
+        uncapped = single and any(key.get("uncapped") for key in keys.values())
+        left = max(0.0, wallet)
+        used = max(0.0, min(100.0, (purchased - left) / purchased * 100.0)) if purchased and purchased > 0 else None
+        if used is not None:
+            detail = f"${left:.2f} of ${purchased:.2f} purchased"
+        else:
+            detail = "Account balance · key has no spending limit" if uncapped else "Account balance shared by all keys"
+        account = {
+            "label": "Account credits",
+            "used_percent": used,
+            "remaining_percent": None if used is None else 100.0 - used,
+            "remaining_amount": left,
+            "currency": "USD",
+            "resets_at": None,
+            "detail": detail,
+            "warning": wallet <= 0.0 or (used is not None and used >= 85.0),
+            "scope": "account",
+            "window_id": "account_credits",
+        }
+        if credits and account["remaining_amount"] < min(w["remaining_amount"] for w in credits):
+            credits.insert(0, account)
+        else:
+            credits.append(account)
+    return credits + [w for w in windows if w.get("label") not in replaced], spend + rest
+
+
 def _adapt_record(slug: str, label: str, rec: dict[str, Any], fetched_at: str | None) -> dict[str, Any]:
     """One official-cache provider record → the menu-bar QuotaPayload provider shape."""
     reason = rec.get("unavailable_reason")
@@ -224,6 +362,7 @@ def _adapt_record(slug: str, label: str, rec: dict[str, Any], fetched_at: str | 
                 "detail": f"${balance:.2f} available",
                 "warning": balance <= 0.0,
             })
+        windows, details = _openrouter_view(windows, details)
     if reason in _AUTH_REASONS:
         status = "authentication_required"
         message = f"Sign in to {label} on the gateway."
@@ -349,7 +488,7 @@ def _load(refresh: bool) -> dict[str, Any]:
         if age is None or age > CACHE_SECONDS or (refresh and age > _MIN_REFRESH_SECONDS):
             _refresh_official_cache()
             official = _read_official_cache()
-        configured = _configured_providers()
+        configured = _configured_providers(official)
         providers = [_provider(slug, label, official) for slug, label in configured]
         _cache = {
             # broker identifies the gateway host these quotas belong to, so a

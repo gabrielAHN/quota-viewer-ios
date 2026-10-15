@@ -69,7 +69,7 @@ def main() -> int:
     except Exception:
         pass
     cache = mod._read_official_cache()
-    for slug, label in mod._configured_providers():
+    for slug, label in mod._configured_providers(cache):
         try:
             result = mod._provider(slug, label, cache)
             if result.get("status") == "ok" and result.get("windows"):

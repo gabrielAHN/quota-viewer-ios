@@ -290,12 +290,14 @@ def hermes_connection():
         conns = json.loads((SUPPORT / "connections.json").read_text())
     except (OSError, ValueError):
         return None, None
-    entries = conns.get("connections") or []
-    by_id = {entry.get("id"): entry for entry in entries if isinstance(entry, dict)}
-    primary = by_id.get(conns.get("primary")) or (entries[0] if entries else None)
-    if not isinstance(primary, dict):
+    entries = [entry for entry in (conns.get("connections") or []) if isinstance(entry, dict)]
+    by_id = {entry.get("id"): entry for entry in entries}
+    ordered = [entry for entry in (by_id.get(conns.get("lastUsed")), by_id.get(conns.get("primary"))) if entry] + entries
+    active = next((entry for entry in ordered if entry.get("kind") != "local" and entry.get("url")), None) \
+        or (ordered[0] if ordered else None)
+    if not isinstance(active, dict):
         return None, None
-    return primary.get("kind"), (primary.get("url") or "").rstrip("/") or None
+    return active.get("kind"), (active.get("url") or "").rstrip("/") or None
 
 
 def gateway_reachable(url, timeout):

@@ -1,9 +1,15 @@
 """Exercise the installed upstream fetch/serializer, not a reimplementation."""
 import importlib.util
+import functools
+import inspect
+import io
+import json
 import sys
 import types
 import unittest
+import urllib.error
 from pathlib import Path
+from typing import Callable
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -407,6 +413,79 @@ class AnthropicCompatTests(unittest.TestCase):
         json_method = self.httpx.Response.json
         self.assertFalse(self.compat.install(empty, self.httpx))
         self.assertIs(json_method, self.httpx.Response.json)
+
+
+class OpenRouterCreditsCompatTests(unittest.TestCase):
+    def setUp(self):
+        self.up = load('openrouter_upstream_fixture', ROOT / 'tests/fixtures/openrouter_upstream.py')
+        self.up._resolve_credentials = lambda: [('Key 1 (native)', 'fixture-key')]
+        self.requests = []
+        self.credits = {'data': {'total_credits': 80, 'total_usage': 75.99}}
+        self.key = {'data': {'limit': 44, 'limit_remaining': 44, 'limit_reset': 'daily', 'usage': 55.5,
+                             'usage_daily': 0, 'usage_weekly': 35.67, 'usage_monthly': 36.39}}
+        owner = self
+
+        def urlopen(request, timeout=None):
+            owner.requests.append(request.full_url)
+            payload = owner.credits if request.full_url.endswith('/credits') else owner.key
+            if isinstance(payload, Exception):
+                raise payload
+            return io.BytesIO(json.dumps(payload).encode())
+        self.up._urlopen = urlopen
+        registry_module = {'functools': functools, 'Callable': Callable, 'PROVIDER_FETCHERS': {},
+                           'QuotaResult': self.up.QuotaResult, 'build_unavailable': self.up.build_unavailable}
+        exec(compile(inspect.getsource(self.up.register), 'quota_providers/registry.py', 'exec'), registry_module)
+        registry_module['register']('openrouter')(self.up.fetch_openrouter_quota)
+        self.registry = registry_module['PROVIDER_FETCHERS']
+        self.cache = types.SimpleNamespace(PROVIDER_FETCHERS=self.registry, _result_to_record=self.up._result_to_record)
+        self.httpx = types.SimpleNamespace(Response=type('Response', (), {'json': lambda self: None}))
+
+    def install(self):
+        self.compat = load('quota_metadata_compat_openrouter', ROOT / 'dashboard/quota_metadata_compat.py')
+        self.compat.install(self.cache, self.httpx)
+
+    def fetch(self):
+        self.requests.clear()
+        return self.registry['openrouter']()
+
+    def test_total_comes_from_the_same_credits_request(self):
+        baseline = self.fetch()
+        baseline_requests = sorted(self.requests)
+        self.install()
+        result = self.fetch()
+        self.assertEqual(sorted(self.requests), baseline_requests)
+        self.assertEqual(len(self.requests), 2)
+        wallet = next(i for i, line in enumerate(result.details) if line.startswith('Account wallet via '))
+        self.assertEqual(result.details[wallet + 1], 'Account credits purchased: USD 80.00')
+        self.assertEqual([d for d in result.details if 'purchased' not in d], baseline.details)
+        record = self.up._result_to_record(result)
+        plugin = load('quota_window_metadata_for_compat', ROOT / 'tests/test_quota_window_metadata.py').load_plugin()
+        adapted = plugin['_adapt_record']('openrouter', 'OpenRouter', record, None)
+        account, key = adapted['windows']
+        self.assertEqual((account['label'], account['remaining_amount'], account['detail']),
+                         ('Account credits', 4.01, '$4.01 of $80.00 purchased'))
+        self.assertAlmostEqual(account['remaining_percent'], 5.0125)
+        self.assertEqual((key['label'], key['remaining_amount'], key['remaining_percent']), ('Key credits', 44.0, 100.0))
+        self.assertEqual(adapted['details'], ['Spent today $0.00 · week $35.67 · month $36.39'])
+
+    def test_missing_total_or_failed_wallet_leaves_result_unchanged(self):
+        self.install()
+        for credits in ({'data': {'total_usage': 1}}, {'data': {'total_credits': 0, 'total_usage': 0}},
+                        urllib.error.HTTPError('https://openrouter.ai/api/v1/credits', 500, 'x', {}, None)):
+            with self.subTest(credits=credits):
+                self.credits = credits
+                self.assertFalse(any('purchased' in d for d in self.fetch().details))
+
+    def test_only_observes_during_a_fetch_and_installs_once(self):
+        self.install()
+        wrapped = self.registry['openrouter']
+        self.compat.install(self.cache, self.httpx)
+        self.assertIs(self.registry['openrouter'], wrapped)
+        self.assertIsNot(wrapped.__wrapped__, self.up.fetch_openrouter_quota)
+        self.assertIs(inspect.unwrap(wrapped), self.up.fetch_openrouter_quota)
+        self.up._get_json('https://openrouter.ai/api/v1/credits', 'fixture-key')
+        purchased = [d for d in self.fetch().details if 'purchased' in d]
+        self.assertEqual(purchased, ['Account credits purchased: USD 80.00'])
 
 
 class RefreshBootstrapTests(unittest.TestCase):

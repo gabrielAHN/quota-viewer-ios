@@ -18,7 +18,10 @@ provider only appears if it's actually signed in.
 
 ### Shared Desktop authentication
 
-The Hermes reader follows this Mac's primary Hermes Desktop connection and reads
+The Hermes reader follows this Mac's Hermes Desktop gateway connection — a
+configured remote gateway always wins over "This device" (the one Desktop is on,
+then its primary, then any other), so a Desktop window on the local backend never
+turns the gateway's quotas into a local-instance check — and reads
 its saved access token. **Hermes Desktop owns token renewal**: the menu never
 rotates refresh tokens or writes Desktop's credential store. Keep Desktop running
 and connected so it can renew the session. If Desktop is closed, the menu can
@@ -144,10 +147,19 @@ provider refresh.
 
 ## Configuring providers (gateway)
 
-The plugin reports a configurable set via `PROVIDER_QUOTA_PROVIDERS`
-(comma-separated slugs, optionally `slug=Label`); unset defaults to
+By default the plugin reports the providers Hermes on the gateway actually has
+credentials for: every provider in the official quota plugin's cache that is not
+`no-credentials`, `not-logged-in` or `opt-in-disabled` (a provider with a recent
+good reading stays listed through a brief credential blip). Set
+`PROVIDER_QUOTA_PROVIDERS` (comma-separated slugs, optionally `slug=Label`) to pin
+an explicit set; with no quota cache yet it falls back to
 `openrouter,anthropic,openai-codex`. Every quota is read through the gateway's own
 credentials, so the plugin stays tied to the gateway it runs in.
+
+OpenRouter is shown as credits: **Key credits** is what the connected key can
+still spend under its cap (resetting on OpenRouter's UTC daily/weekly/monthly
+schedule), **Account credits** is the shared wallet, and whichever is tighter is
+listed first, with today/week/month spend underneath.
 
 ## Self-healing quota (last-good refresher)
 

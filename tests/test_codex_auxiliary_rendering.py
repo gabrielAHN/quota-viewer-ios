@@ -25,6 +25,8 @@ extension AppDelegate {
                     return ["text": field.stringValue, "fits": field.attributedStringValue.size().width <= field.frame.width]
                 },
                 "bars": view.subviews.filter { $0.frame.height == 5 && !$0.subviews.isEmpty }.count,
+                "fill": view.subviews.filter { $0.frame.height == 5 }.flatMap { $0.subviews.map { (Double($0.frame.width) * 100).rounded() / 100 } },
+                "header_bars": header.subviews.filter { $0.frame.height == 5 && !$0.subviews.isEmpty }.count,
                 "text": view.subviews.compactMap { ($0 as? NSTextField)?.stringValue },
                 "fields": view.subviews.compactMap { child -> [String: Any]? in
                     guard let field = child as? NSTextField else { return nil }
@@ -146,12 +148,46 @@ struct RenderingTest {
         self.assertTrue(all(f["fits"] for row in rows for f in row["fields"]))
         self.assertTrue(any("31% used" in f["text"] for f in rows[0]["header"]))
 
-    def test_unknown_and_credit_windows_keep_text_only_rendering(self):
-        credit = self.window("Account credits", 100)
+    def test_unknown_and_uncapped_credit_windows_keep_text_only_rendering(self):
+        credit = self.window("Account credits", None)
         credit.update(remaining_amount=12.5, currency="USD")
         for window in (credit, self.window(percent=None)):
             with self.subTest(window=window):
                 self.assertEqual(self.render([window], "openrouter")[0]["bars"], 0)
+
+    def test_openrouter_key_credits_show_amount_limit_bar_and_reset(self):
+        key = dict(label="Key credits", remaining_percent=9.03, remaining_amount=3.61, currency="USD",
+                   resets_at="2099-11-01T00:00:00+00:00", detail="$3.61 of $40.00 key limit",
+                   warning=True, scope="api-key", window_id="api_key_limit")
+        account = dict(label="Account credits", remaining_amount=4.01, currency="USD",
+                       detail="Account balance shared by all keys", warning=False,
+                       scope="account", window_id="account_credits")
+        key_row, account_row = self.render([key, account], "openrouter")
+        self.assertEqual(key_row["text"][:2], ["Key credits", "$3.61 available"])
+        self.assertRegex(key_row["text"][2], r"^\$3\.61 of \$40\.00 key limit · resets in \d+d \d+h$")
+        self.assertEqual(account_row["text"], ["Account credits", "$4.01 available", "Account balance shared by all keys"])
+        self.assertEqual([row["bars"] for row in (key_row, account_row)], [1, 0])
+        self.assertEqual(key_row["fill"], [round(312 * 9.03 / 100, 2)])
+        self.assertTrue(all(f["fits"] for row in (key_row, account_row) for f in row["fields"]))
+        header = [f["text"] for f in key_row["header"]]
+        self.assertIn("Key credits · $3.61 available", header)
+        self.assertTrue(any(text.startswith("Resets in ") for text in header))
+        self.assertEqual(key_row["header_bars"], 1)
+        self.assertTrue(all(f["fits"] for f in key_row["header"]))
+
+    def test_openrouter_wallet_bar_from_purchased_total_leads_when_tighter(self):
+        account = dict(label="Account credits", remaining_percent=6.68, remaining_amount=4.01, currency="USD",
+                       detail="$4.01 of $60.00 purchased", warning=True, scope="account", window_id="account_credits")
+        key = dict(label="Key credits", remaining_percent=100, remaining_amount=44.0, currency="USD",
+                   resets_at="2099-11-01T00:00:00+00:00", detail="$44.00 of $44.00 key limit",
+                   warning=False, scope="api-key", window_id="api_key_limit")
+        account_row, key_row = self.render([account, key], "openrouter")
+        self.assertEqual([row["bars"] for row in (account_row, key_row)], [1, 1])
+        self.assertEqual(account_row["text"], ["Account credits", "$4.01 available", "$4.01 of $60.00 purchased"])
+        header = [f["text"] for f in account_row["header"]]
+        self.assertEqual(header[1:], ["Account credits · $4.01 available", "$4.01 of $60.00 purchased"])
+        self.assertEqual(account_row["header_bars"], 1)
+        self.assertTrue(all(f["fits"] for row in (account_row, key_row) for f in row["fields"] + row["header"]))
 
 
 if __name__ == "__main__":

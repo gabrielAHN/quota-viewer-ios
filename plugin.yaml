@@ -1,13 +1,13 @@
 name: provider-quota
 version: 1.0.0
-description: Provider quota + live-session broker for your gateway (quotas + activity; defaults to OpenRouter, Claude, Codex)
+description: Provider quota + live-session broker for your gateway (quotas + activity for the providers Hermes has credentials for)
 author: gabrielAHN
 kind: standalone
 platforms:
   - macos
-# The provider set is configurable per gateway via the PROVIDER_QUOTA_PROVIDERS
-# env var (comma-separated "slug" or "slug=Label"); all quotas are read through
-# the host gateway's own account_usage credentials. See README.
+# By default the provider set follows the gateway's Hermes credentials (the quota
+# plugin's cache); PROVIDER_QUOTA_PROVIDERS (comma-separated "slug" or
+# "slug=Label") pins an explicit set. See README.
 config:
   env:
     - PROVIDER_QUOTA_PROVIDERS

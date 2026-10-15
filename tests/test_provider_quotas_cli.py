@@ -176,6 +176,18 @@ class ProviderQuotasCliTests(unittest.TestCase):
         self.assertRegex(out, r"\d+ problem\(s\), \d+ warning\(s\)")
         self.assertEqual(self.state_files(), before)
 
+    def test_doctor_checks_the_gateway_not_this_device(self):
+        self.payload_helper("hermes-desktop-quotas")
+        support = self.home / "Library/Application Support/Hermes"
+        support.mkdir(parents=True)
+        (support / "connections.json").write_text(json.dumps({
+            "version": 2, "primary": "gateway", "lastUsed": "local", "launchMode": "last-used",
+            "connections": [{"id": "local", "kind": "local"},
+                            {"id": "gateway", "kind": "remote", "url": "http://127.0.0.1:9/hermes/"}]}))
+        result = self.run_cli("doctor", "--timeout", "2")
+        self.assertIn("Hermes Desktop connection: remote http://127.0.0.1:9/hermes", result.stdout)
+        self.assertNotIn("local backend", result.stdout)
+
     def test_logs_prints_tail(self):
         logs = self.home / ".hermes/logs"
         logs.mkdir(parents=True)
