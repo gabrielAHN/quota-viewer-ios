@@ -68,7 +68,8 @@ def main() -> int:
         mod._refresh_official_cache()
     except Exception:
         pass
-    cache = mod._read_official_cache()
+    # Merged view (named Claude accounts included) when the installed plugin has it.
+    cache = getattr(mod, "_read_quota_cache", mod._read_official_cache)()
     for slug, label in mod._configured_providers(cache):
         try:
             result = mod._provider(slug, label, cache)
