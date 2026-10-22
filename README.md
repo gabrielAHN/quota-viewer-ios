@@ -156,6 +156,24 @@ an explicit set; with no quota cache yet it falls back to
 `openrouter,anthropic,openai-codex`. Every quota is read through the gateway's own
 credentials, so the plugin stays tied to the gateway it runs in.
 
+**One Claude row per account.** Hermes can list several Claude subscriptions as
+separate named providers: a `providers.<slug>` entry on `api.anthropic.com` whose
+key comes from `key_cmd` (say a personal plan and a team seat). The official quota
+plugin only reads the gateway's single built-in `anthropic` login, so the plugin
+reads each named account itself in the same fresh refresh subprocess. It gets the
+token from the account's own `key_cmd`, through Hermes's runner. It then calls
+Anthropic's OAuth usage endpoint, plus the profile endpoint for the plan badge at
+most every 6 h, and writes `$HERMES_HOME/provider_quota_accounts.json`. Tokens are
+never written or returned.
+
+Each account appears under the provider's name, where Claude sits in the list,
+with the same windows and metadata as the Local Claude reader. The windows are the
+5h session, the week, and the model weeks. When the gateway hides the built-in
+`anthropic` provider from its picker (`model_catalog.excluded_providers`), its row
+would duplicate one of the accounts, so it is dropped too. The app colours these
+rows as Claude, using the payload's `family` field, or the `claude-*` slug as a
+fallback.
+
 OpenRouter is shown as credits: **Key credits** is what the connected key can
 still spend under its cap (resetting on OpenRouter's UTC daily/weekly/monthly
 schedule), **Account credits** is the shared wallet, and whichever is tighter is

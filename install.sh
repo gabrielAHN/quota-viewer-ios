@@ -24,6 +24,7 @@ install -m 644 "$service_home/__init__.py" "$plugin_target/__init__.py"
 install -m 644 "$service_home/dashboard/manifest.json" "$plugin_target/dashboard/manifest.json"
 install -m 644 "$service_home/dashboard/plugin_api.py" "$plugin_target/dashboard/plugin_api.py"
 install -m 644 "$service_home/dashboard/quota_metadata_compat.py" "$plugin_target/dashboard/quota_metadata_compat.py"
+install -m 644 "$service_home/dashboard/claude_accounts.py" "$plugin_target/dashboard/claude_accounts.py"
 install -m 755 "$service_home/dashboard/refresh_lastgood.py" "$plugin_target/dashboard/refresh_lastgood.py"
 rm -rf "$plugin_target/dashboard/__pycache__" 2>/dev/null || true
 hermes plugins enable provider-quota >/dev/null 2>&1 || true

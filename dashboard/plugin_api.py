@@ -45,13 +45,22 @@ def _hermes_providers(cache: dict[str, Any]) -> str:
     records = cache.get("providers") if isinstance(cache, dict) else None
     if not isinstance(records, dict):
         return ""
+    hidden = set(cache.get("hide") or ())
     slugs = [
         slug for slug, rec in records.items()
-        if isinstance(rec, dict) and (
+        if slug not in hidden and isinstance(rec, dict) and (
             rec.get("unavailable_reason") not in _AUTH_REASONS or _fresh_last_good(slug) is not None)
     ]
     order = list(_KNOWN_LABELS)
-    slugs.sort(key=lambda slug: (order.index(slug) if slug in order else len(order), slug))
+
+    def rank(slug: str) -> tuple[int, int, str]:
+        # A named account (one row per Claude subscription) sorts where its vendor sits,
+        # in the gateway config's order, right after the built-in row if both are shown.
+        rec = records[slug]
+        family = rec.get("family") if rec.get("account") else slug
+        position = order.index(family) if family in order else len(order)
+        return (position, 1 if rec.get("account") else 0, "" if rec.get("account") else slug)
+    slugs.sort(key=rank)
     return ",".join(slugs)
 
 
@@ -67,8 +76,12 @@ def _configured_providers(cache: dict[str, Any] | None = None) -> tuple[tuple[st
     gateway it's installed in.
     """
     raw = os.environ.get("PROVIDER_QUOTA_PROVIDERS", "").strip()
+    cache = _read_quota_cache() if cache is None else cache
+    records = cache.get("providers") if isinstance(cache, dict) else None
+    names = {slug: str(rec["label"]) for slug, rec in (records or {}).items()
+             if isinstance(rec, dict) and rec.get("account") and rec.get("label")}
     if not raw:
-        raw = _hermes_providers(_read_official_cache() if cache is None else cache) or _DEFAULT_PROVIDERS
+        raw = _hermes_providers(cache) or _DEFAULT_PROVIDERS
     providers: list[tuple[str, str]] = []
     seen: set[str] = set()
     for item in raw.split(","):
@@ -80,7 +93,7 @@ def _configured_providers(cache: dict[str, Any] | None = None) -> tuple[tuple[st
         if not slug or slug in seen:
             continue
         seen.add(slug)
-        providers.append((slug, label.strip() if sep and label.strip() else _label_for(slug)))
+        providers.append((slug, label.strip() if sep and label.strip() else names.get(slug) or _label_for(slug)))
     return tuple(providers)
 
 
@@ -153,6 +166,33 @@ def _read_official_cache() -> dict[str, Any]:
     return {"fetched_at": None, "providers": {}}
 
 
+_ACCOUNTS_CACHE = "provider_quota_accounts.json"
+
+
+def _read_accounts_cache() -> dict[str, Any]:
+    """Named Claude accounts (claude_accounts.py), written by the same fresh refresh:
+    {fetched_at, hide: [built-in slug], providers: {slug: official-shape record + fetched_at}}."""
+    try:
+        with open(_hermes_home() / _ACCOUNTS_CACHE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and isinstance(data.get("providers"), dict):
+            return data
+    except Exception:
+        pass
+    return {"fetched_at": None, "hide": [], "providers": {}}
+
+
+def _read_quota_cache() -> dict[str, Any]:
+    """The official cache with the named Claude accounts merged in (each account keeps
+    its own fetched_at) and the built-in rows those accounts replace marked hidden."""
+    official = _read_official_cache()
+    accounts = _read_accounts_cache()
+    providers = dict(official.get("providers") or {})
+    providers.update({slug: rec for slug, rec in accounts["providers"].items() if isinstance(rec, dict)})
+    hide = [slug for slug in accounts.get("hide") or () if isinstance(slug, str)]
+    return {**official, "providers": providers, "hide": hide, "accounts_fetched_at": accounts.get("fetched_at")}
+
+
 def _cache_age_seconds(cache: dict[str, Any]) -> float | None:
     ts = cache.get("fetched_at")
     if not ts:
@@ -203,6 +243,11 @@ def _refresh_official_cache() -> None:
         "except Exception:\n"
         "    pass\n"
         "refresh_quota_cache()\n"
+        "try:\n"
+        "    from claude_accounts import refresh_accounts_cache\n"
+        "    refresh_accounts_cache()\n"
+        "except Exception:\n"
+        "    pass\n"
     ) % (str(root.parent), str(Path(__file__).resolve().parent))
     try:
         subprocess.run(
@@ -388,7 +433,10 @@ def _adapt_record(slug: str, label: str, rec: dict[str, Any], fetched_at: str | 
 def _provider(provider: str, label: str, cache: dict[str, Any]) -> dict[str, Any]:
     rec = cache.get("providers", {}).get(provider)
     if isinstance(rec, dict):
-        result = _adapt_record(provider, label, rec, cache.get("fetched_at"))
+        result = _adapt_record(provider, label, rec, rec.get("fetched_at") or cache.get("fetched_at"))
+        if rec.get("account"):
+            result["source"] = "account usage"
+            result["family"] = rec.get("family")
     else:
         result = {
             "provider": provider,
@@ -481,13 +529,14 @@ def _load(refresh: bool) -> dict[str, Any]:
         # refresh returns the last payload instead of hammering upstream.
         if _cache is not None and now - _cache_at < _MIN_REFRESH_SECONDS:
             return _cache
-        official = _read_official_cache()
-        age = _cache_age_seconds(official)
-        # Re-sweep when the official cache is stale (or a refresh was asked and it
-        # is older than the refresh floor); the plugin's own budget bounds it.
-        if age is None or age > CACHE_SECONDS or (refresh and age > _MIN_REFRESH_SECONDS):
+        official = _read_quota_cache()
+        ages = (_cache_age_seconds(official),
+                _cache_age_seconds({"fetched_at": official.get("accounts_fetched_at")}))
+        # Re-sweep when either cache is stale (or a refresh was asked and it is older
+        # than the refresh floor); the plugin's own budget bounds it.
+        if any(age is None or age > CACHE_SECONDS or (refresh and age > _MIN_REFRESH_SECONDS) for age in ages):
             _refresh_official_cache()
-            official = _read_official_cache()
+            official = _read_quota_cache()
         configured = _configured_providers(official)
         providers = [_provider(slug, label, official) for slug, label in configured]
         _cache = {
@@ -705,7 +754,7 @@ def _recent_session_ids(home: Path, sids: set[str], window: float, now: float) -
 # service isn't present. Provider follows the same bot→provider map the webchat uses.
 _WEBCHAT_URL = "http://127.0.0.1:8090/api/running"
 _WEBCHAT_KEY_FILE = Path.home() / ".hermes" / "helper-chat" / ".key"
-_BOT_PROVIDER = {"helper": "openrouter", "carto": "copilot-acp", "default": "anthropic"}
+_BOT_PROVIDER = {"helper": "openrouter", "carto": "anthropic", "default": "anthropic"}
 
 
 _webchat_seen: dict[str, dict[str, Any]] = {}   # sid -> {"t": last_seen, "provider": …}

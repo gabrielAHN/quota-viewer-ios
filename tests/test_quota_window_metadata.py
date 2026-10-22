@@ -317,7 +317,7 @@ class LocalAntigravityWindowTests(unittest.TestCase):
 
 PLUGIN_NAMES = {"_adapt_record", "_openrouter_view", "_next_utc_reset", "_AUTH_REASONS", "_OR_KEY", "_OR_USD",
                 "_OR_NOISE", "_OR_SPEND", "_KNOWN_LABELS", "_DEFAULT_PROVIDERS", "_label_for",
-                "_hermes_providers", "_configured_providers"}
+                "_hermes_providers", "_configured_providers", "_read_quota_cache", "_provider"}
 
 
 def load_plugin(**stubs):
@@ -472,7 +472,8 @@ class OfficialCacheMetadataTests(unittest.TestCase):
 class HermesProviderSetTests(unittest.TestCase):
     def providers(self, cache, last_good=(), env=""):
         plugin = load_plugin(_fresh_last_good=lambda slug: {} if slug in last_good else None,
-                             _read_official_cache=lambda: cache)
+                             _read_official_cache=lambda: cache,
+                             _read_accounts_cache=lambda: {"fetched_at": None, "hide": [], "providers": {}})
         with patch.dict("os.environ", {"PROVIDER_QUOTA_PROVIDERS": env}):
             return plugin["_configured_providers"](cache), plugin["_configured_providers"]()
 

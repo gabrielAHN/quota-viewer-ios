@@ -20,6 +20,9 @@ struct QuotaProvider: Codable {
     let windows: [QuotaWindow]
     let details: [String]
     let message: String?
+    // The vendor behind a named per-account provider (e.g. "anthropic" for one row
+    // per Claude subscription), so the row takes that vendor's colour.
+    var family: String? = nil
 }
 
 struct QuotaWindow: Codable {
@@ -2057,8 +2060,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // Named per-account providers keep their own slug (their own row, dot and hide
+    // state) but take their vendor's colour: from the gateway's `family`, else a
+    // "claude-*" slug is a Claude account.
+    static var providerFamilies: [String: String] = [:]
+
+    static func providerFamily(_ slug: String) -> String {
+        let normalized = normalizedProvider(slug)
+        if let family = providerFamilies[normalized] { return family }
+        if normalized.hasPrefix("claude-") { return "anthropic" }
+        return normalized
+    }
+
     static func providerHex(_ slug: String) -> String {
-        switch normalizedProvider(slug) {
+        switch providerFamily(slug) {
         case "openrouter":   return "#8e1afe"   // purple
         case "opencode":     return "#38bdf8"   // sky blue (opencode's own OpenRouter key)
         case "anthropic":    return "#d97757"   // orange
@@ -3230,6 +3245,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             policy.succeeded(at: now)
             sourcePolicies[kind] = policy
             let providers = applyLastGood(payload.providers, kind: kind)
+            for provider in providers {
+                if let family = provider.family, !family.isEmpty {
+                    Self.providerFamilies[Self.normalizedProvider(provider.provider)] = Self.normalizedProvider(family)
+                }
+            }
             lastProvidersByKind[kind.rawValue] = providers.map { ($0.provider, $0.label) }
             UserDefaults.standard.set(providers.map { $0.provider }, forKey: "lastProviderSlugs.\(kind.rawValue)")
             UserDefaults.standard.set(providers.map { $0.label }, forKey: "lastProviderLabels.\(kind.rawValue)")
