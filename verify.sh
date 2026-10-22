@@ -19,7 +19,10 @@ jq -e '.broker | type == "string" and length > 0' <<<"$response" >/dev/null
 jq -e '(.providers | length) > 0 and all(.providers[]; (.provider | length) > 0 and (.label | length) > 0)' <<<"$response" >/dev/null
 jq -e '[.providers[].provider] | length == (unique | length)' <<<"$response" >/dev/null
 jq -e '.providers[] | .status | IN("ok", "unavailable", "authentication_required")' <<<"$response" >/dev/null
-jq -e '.providers[] | select(.provider == "openrouter") | if .status == "ok" then ([.windows[].label] == ["Account credits"] and .windows[0].remaining_amount != null and .windows[0].used_percent == null and (.details | length) == 0) else true end' <<<"$response" >/dev/null
+# OpenRouter is credits (Account / Key credits, plus a spend line in details).
+jq -e '.providers[] | select(.provider == "openrouter") | if .status == "ok" then ((.windows | length) > 0 and all(.windows[]; (.label | IN("Account credits", "Key credits")) and .remaining_amount != null)) else true end' <<<"$response" >/dev/null
+# Named Claude accounts (one row per subscription) are Claude-family rows.
+jq -e 'all(.providers[] | select(.source == "account usage"); .family == "anthropic")' <<<"$response" >/dev/null
 
 # The last-good refresher keeps the dashboard's disk fallback current so a rotted
 # long-lived process never blanks the menu. Confirm the script installed and the
