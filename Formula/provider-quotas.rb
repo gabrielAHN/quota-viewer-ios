@@ -52,9 +52,12 @@ class ProviderQuotas < Formula
         brew services start provider-quotas
 
       Click the menu-bar icon, then turn on Hermes and/or Local under "Sources".
+      Each provider is read from its usual folder. To use another one, open the
+      gear (Settings) button or run: provider-quotas config <provider> <path>
       Debug from the terminal:
         provider-quotas              (quotas as the menu reads them)
         provider-quotas doctor       (install, service, sources, gateway, logs)
+        provider-quotas config       (what is read and shown, and where from)
       Update later with:
         brew upgrade provider-quotas        (or the in-app "Check for Updates")
 

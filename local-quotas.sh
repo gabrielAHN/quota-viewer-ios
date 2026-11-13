@@ -5,17 +5,24 @@
 # at all (the menu-bar app's "Local" option).
 #
 # Sources, all read locally and best-effort (a provider is shown only when its
-# credential exists here):
-#   • Claude  — ~/.claude/.credentials.json or the login Keychain
-#               ("Claude Code-credentials") → api.anthropic.com/api/oauth/usage
-#   • Codex   — the freshest of ~/.codex/auth.json or a Goose
-#               chatgpt_codex/tokens.json → chatgpt.com/backend-api/wham/usage
-#   • OpenRouter — OPENROUTER_API_KEY from the env or ~/.hermes/.env
-#               → openrouter.ai/api/v1/credits
+# credential exists here). Each location can be pointed elsewhere from the app's
+# Settings or `provider-quotas config`; the app passes custom ones in
+# PROVIDER_QUOTAS_<NAME>_HOME (PROVIDER_QUOTAS_OPENROUTER_ENV for the key file):
+#   • Claude  — <Claude folder>/.credentials.json or its login Keychain item
+#               (~/.claude and "Claude Code-credentials" by default; another
+#               folder uses the item Claude Code names after it)
+#               → api.anthropic.com/api/oauth/usage
+#   • Codex   — <Codex home>/auth.json (~/.codex, or CODEX_HOME), or a Goose
+#               chatgpt_codex/tokens.json when Codex is automatic, freshest wins
+#               → chatgpt.com/backend-api/wham/usage
+#   • Antigravity — the agy login Keychain item or <folder>/antigravity-oauth-token
+#               (~/.gemini/antigravity-cli) → Cloud Code quota API
+#   • OpenRouter — a custom key file, else OPENROUTER_API_KEY from the env or
+#               the Hermes home's .env → openrouter.ai/api/v1/credits
 #   • opencode — the OpenRouter key opencode itself authenticated with
-#               (~/.local/share/opencode/auth.json) → the same credits API,
-#               shown as its own row so it reads like the Hermes source's
-#               OpenRouter entry
+#               (<opencode data>/auth.json, ~/.local/share/opencode) → the same
+#               credits API, shown as its own row so it reads like the Hermes
+#               source's OpenRouter entry
 #
 # Portable: system python3 + security(1) only (no Hermes venv / httpx). Prints
 # the same QuotaPayload JSON the gateway plugin returns on stdout; on failure
@@ -23,13 +30,38 @@
 # exits non-zero, so the app can show a "sign in" state.
 set -euo pipefail
 exec /usr/bin/env python3 - "$@" <<'PY'
-import base64, json, math, os, subprocess, sys, time, urllib.request, urllib.error
+import base64, hashlib, json, math, os, subprocess, sys, time, unicodedata, urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HOME = Path.home()
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+
+
+def _setting(name):
+    value = (os.environ.get(name) or "").strip()
+    return Path(os.path.abspath(os.path.expanduser(value))) if value else None
+
+
+def _claude_home():
+    return _setting("PROVIDER_QUOTAS_CLAUDE_HOME") or _setting("CLAUDE_CONFIG_DIR") or HOME / ".claude"
+
+
+def _claude_services(folder):
+    base = "Claude Code-credentials"
+    path = unicodedata.normalize("NFC", str(folder))
+    hashed = [base + "-" + hashlib.sha256(text.encode()).hexdigest()[:8] for text in (path, path + "/")]
+    return [base, hashed[0]] if folder == HOME / ".claude" else hashed
+
+
+def _codex_home():
+    return _setting("PROVIDER_QUOTAS_CODEX_HOME") or _setting("CODEX_HOME") or HOME / ".codex"
+
+
+def _opencode_home():
+    data = _setting("XDG_DATA_HOME")
+    return _setting("PROVIDER_QUOTAS_OPENCODE_HOME") or (data / "opencode" if data else HOME / ".local" / "share" / "opencode")
 
 
 def fail(msg):
@@ -116,18 +148,20 @@ def _antigravity_secret(value):
 
 
 def _antigravity_credentials():
-    try:
-        raw = subprocess.check_output(
-            ["security", "find-generic-password", "-a", "antigravity", "-s", "gemini", "-w"],
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-        )
-        data = _antigravity_secret(raw)
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-    path = HOME / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+    custom = _setting("PROVIDER_QUOTAS_ANTIGRAVITY_HOME")
+    if custom is None:
+        try:
+            raw = subprocess.check_output(
+                ["security", "find-generic-password", "-a", "antigravity", "-s", "gemini", "-w"],
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            data = _antigravity_secret(raw)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    path = (custom or HOME / ".gemini" / "antigravity-cli") / "antigravity-oauth-token"
     try:
         data = json.loads(path.read_text())
         return data if isinstance(data, dict) else None
@@ -264,23 +298,33 @@ def antigravity_provider():
 
 # --- Claude (Anthropic OAuth usage) --------------------------------------------
 def _anthropic_token():
-    path = HOME / ".claude" / ".credentials.json"
-    if path.exists():
-        try:
-            data = json.loads(path.read_text())
-            token = ((data.get("claudeAiOauth") or {}).get("accessToken") or "").strip()
-            if token:
-                return token
-        except Exception:
-            pass
+    folder = _claude_home()
+    saved = []
     try:
-        raw = subprocess.check_output(
-            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
-            stderr=subprocess.DEVNULL,
-        ).decode()
-        return ((json.loads(raw).get("claudeAiOauth") or {}).get("accessToken") or "").strip() or None
+        saved.append(json.loads((folder / ".credentials.json").read_text()))
     except Exception:
-        return None
+        pass
+    for service in _claude_services(folder):
+        try:
+            raw = subprocess.check_output(
+                ["security", "find-generic-password", "-s", service, "-w"],
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            ).decode()
+            saved.append(json.loads(raw))
+        except Exception:
+            continue
+    best = None
+    for data in saved:
+        oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+        token = str((oauth or {}).get("accessToken") or "").strip() if isinstance(oauth, dict) else ""
+        if not token:
+            continue
+        expires = oauth.get("expiresAt")
+        expires = expires if isinstance(expires, (int, float)) and not isinstance(expires, bool) else 0
+        if best is None or expires > best[0]:
+            best = (expires, token)
+    return best[1] if best else None
 
 
 def anthropic_provider():
@@ -377,9 +421,12 @@ def _jwt_exp(token):
 def _codex_creds():
     # Every candidate ChatGPT/Codex token store on this Mac; pick the one whose
     # access token is valid the longest so a stale Goose token never shadows a
-    # fresh Codex CLI login (or vice-versa).
+    # fresh Codex CLI login (or vice-versa). A custom Codex home is read alone.
     candidates = []
-    for path in (HOME / ".codex" / "auth.json", HOME / ".config/goose/chatgpt_codex/tokens.json"):
+    paths = [_codex_home() / "auth.json"]
+    if _setting("PROVIDER_QUOTAS_CODEX_HOME") is None:
+        paths.append(HOME / ".config/goose/chatgpt_codex/tokens.json")
+    for path in paths:
         if not path.exists():
             continue
         try:
@@ -509,11 +556,25 @@ def codex_provider():
 
 
 # --- OpenRouter (credits API) --------------------------------------------------
+def _hermes_root():
+    home = (os.environ.get("PROVIDER_QUOTAS_HERMES_HOME") or os.environ.get("HERMES_HOME") or "").strip()
+    if not home:
+        return Path.home() / ".hermes"
+    path = Path(os.path.abspath(os.path.expanduser(home)))
+    return path.parent.parent if path.parent.name.lower() == "profiles" else path
+
+
 def _openrouter_key():
+    custom = _setting("PROVIDER_QUOTAS_OPENROUTER_ENV")
+    if custom is not None:
+        return _env_file_key(custom)
     key = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
     if key:
         return key
-    env_path = HOME / ".hermes" / ".env"
+    return _env_file_key(_hermes_root() / ".env")
+
+
+def _env_file_key(env_path):
     if env_path.exists():
         try:
             for line in env_path.read_text().splitlines():
@@ -599,7 +660,7 @@ def openrouter_provider():
 
 # --- opencode (OpenRouter credits through opencode's own login) ----------------
 def _opencode_key():
-    path = HOME / ".local" / "share" / "opencode" / "auth.json"
+    path = _opencode_home() / "auth.json"
     if not path.exists():
         return None
     try:

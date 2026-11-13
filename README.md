@@ -22,7 +22,12 @@ The Hermes reader follows this Mac's Hermes Desktop gateway connection — a
 configured remote gateway always wins over "This device" (the one Desktop is on,
 then its primary, then any other), so a Desktop window on the local backend never
 turns the gateway's quotas into a local-instance check — and reads
-its saved access token. **Hermes Desktop owns token renewal**: the menu never
+its saved access token. Current Desktop builds keep that registry and sign-in in
+the Hermes home (`~/.hermes` unless you change it under **Settings**):
+`gateway-connections.json` and `gateway-connection-tokens.json`. Once those exist
+the reader uses only them, and falls back to the older
+`~/Library/Application Support/Hermes` files otherwise.
+**Hermes Desktop owns token renewal**: the menu never
 rotates refresh tokens or writes Desktop's credential store. Keep Desktop running
 and connected so it can renew the session. If Desktop is closed, the menu can
 continue using the saved access token until the gateway rejects it.
@@ -41,6 +46,61 @@ A silent quota connection times out after five seconds; activity requests time o
 after two seconds and stop contacting a failed gateway for the rest of that scan.
 The menu also bounds helper process execution so a stuck reader cannot hang a poll.
 No automatic sign-in, credential repair, or Hermes restart is attempted.
+
+### Settings
+
+The gear button in the menu's bottom bar opens **Settings**. It lists only what
+is active, grouped by source:
+
+- **Hermes**: a switch to read Hermes at all, its home folder, and a switch for
+  each provider Hermes serves.
+- **This Mac**: a switch to read this Mac's own logins, then one row per provider
+  found here, with its own switch.
+
+Switching a provider off hides its activity from the menu bar and the pet; its
+row shrinks to one line, and switching it back on restores it. Switching a whole
+source off stops reading it, and its section shrinks to one line naming what was
+found. Providers that aren't set up on this Mac stay out of the list.
+**Add Provider** names them and adds one from a folder (or, for OpenRouter, a key
+file) you choose. A provider you sign in to later, in its standard location,
+appears on its own. Settings follows the menu's theme: the theme button switches
+both between System, Light and Dark.
+
+Each location starts as **Automatic**, so most installs never change anything:
+
+| Provider | Automatic location | Read from it |
+|---|---|---|
+| Hermes | `HERMES_HOME`, else `~/.hermes` | Hermes Desktop's gateway connection and sign-in, and pets |
+| Claude | `CLAUDE_CONFIG_DIR`, else `~/.claude` | the Claude Code login (Keychain or `.credentials.json`, whichever is newer), sessions and plan |
+| Codex | `CODEX_HOME`, else `~/.codex`, plus Goose's Codex login | `auth.json` and sessions |
+| opencode | `$XDG_DATA_HOME/opencode`, else `~/.local/share/opencode` | `auth.json` (its OpenRouter key) and sessions |
+| Antigravity | `~/.gemini/antigravity-cli`, plus the `agy` Keychain login | its sign-in token |
+| OpenRouter | `OPENROUTER_API_KEY`, else the Hermes home's `.env` | `OPENROUTER_API_KEY` |
+
+Switch a row to **Custom** to read another folder instead, such as a second
+account or a copied login (a key file for OpenRouter). Pick it with **Choose…**
+or paste a path. Each row's status line says what it found, such as "Signed in
+(auth.json)." or "This folder doesn't exist.", and never shows a secret. A custom
+Claude folder uses the Keychain item Claude Code creates for that folder
+(`Claude Code-credentials-<hash>`, as with `CLAUDE_CONFIG_DIR`). A custom Codex
+home is read on its own, without Goose's login. A Hermes profile folder
+(`…/profiles/<name>`) maps to its Hermes home, as it does in Hermes Desktop.
+
+The same settings work from the terminal, and a change there reaches the running
+menu (and an open Settings window) right away:
+
+```bash
+provider-quotas config                             # sources and providers: on/off, location and status
+provider-quotas config claude ~/work/.claude       # read another folder
+provider-quotas config openrouter ~/keys/openrouter.env
+provider-quotas config claude --automatic          # back to the automatic location
+provider-quotas config codex --off                 # hide Codex (this Mac) from the menu bar and pet
+provider-quotas config hermes:copilot --off        # hide a provider Hermes serves
+provider-quotas config local --on                  # read this Mac (hermes switches Hermes)
+provider-quotas config --json
+```
+
+Setting a location also switches that provider back on.
 
 ## Install
 
@@ -136,14 +196,24 @@ helpers the menu runs, so what it prints is what the menu shows.
 provider-quotas                  # quotas from the sources enabled in the menu
 provider-quotas --source all -v  # both sources, with scopes, fetch age and details
 provider-quotas --json           # raw helper payload
-provider-quotas doctor           # install, service, sources, gateway and recent logs
+provider-quotas doctor           # install, service, sources, gateway, locations and recent logs
 provider-quotas logs             # recent menu-bar app logs
+provider-quotas config           # what is read and shown, and where from (see Settings)
 ```
 
 `status` exits `0` when every source reads, `2` when a source needs sign-in, and
-`1` for other failures. `doctor` exits `1` when it finds a problem. The CLI only
-reads: it never signs in, refreshes credentials, restarts services or forces a
-provider refresh.
+`1` for other failures. `doctor` exits `1` when it finds a problem. Apart from
+`config`, which saves the app's settings, the CLI only reads: it never
+signs in, refreshes credentials, restarts services or forces a provider refresh.
+
+The CLI uses the locations set in the app's Settings or with `config`, and
+`doctor` lists each one with where it came from and what it found. The helpers
+receive custom locations as `PROVIDER_QUOTAS_HERMES_HOME`,
+`PROVIDER_QUOTAS_CLAUDE_HOME`, `PROVIDER_QUOTAS_CODEX_HOME`,
+`PROVIDER_QUOTAS_OPENCODE_HOME`, `PROVIDER_QUOTAS_ANTIGRAVITY_HOME` and
+`PROVIDER_QUOTAS_OPENROUTER_ENV`. Setting one in your shell overrides the app's
+setting for that run, and `config` says so. To run a helper by hand against
+another folder, use `PROVIDER_QUOTAS_HERMES_HOME=/path/to/hermes hermes-desktop-quotas`.
 
 ## Configuring providers (gateway)
 

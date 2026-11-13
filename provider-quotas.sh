@@ -2,13 +2,19 @@
 set -euo pipefail
 exec /usr/bin/env python3 - "$@" <<'PY'
 import argparse
+import ctypes
+import functools
+import hashlib
 import json
 import os
+import plistlib
 import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +25,180 @@ HELPERS = {"hermes": "hermes-desktop-quotas", "local": "hermes-local-quotas"}
 HOME = Path.home()
 SUPPORT = HOME / "Library/Application Support/Hermes"
 USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+DEFAULTS = os.environ.get("PROVIDER_QUOTAS_DEFAULTS") or LABEL
+SETTINGS_CHANGED = LABEL + ".settings"
+LOCATIONS = {
+    "hermes": ("Hermes", "PROVIDER_QUOTAS_HERMES_HOME", "Hermes home: Hermes Desktop's gateway connection and sign-in"),
+    "claude": ("Claude", "PROVIDER_QUOTAS_CLAUDE_HOME", "Claude Code folder: login, sessions and plan"),
+    "codex": ("Codex", "PROVIDER_QUOTAS_CODEX_HOME", "Codex home: auth.json and sessions"),
+    "opencode": ("opencode", "PROVIDER_QUOTAS_OPENCODE_HOME", "opencode data folder: auth.json and sessions"),
+    "antigravity": ("Antigravity", "PROVIDER_QUOTAS_ANTIGRAVITY_HOME", "Antigravity CLI folder: sign-in token"),
+    "openrouter": ("OpenRouter", "PROVIDER_QUOTAS_OPENROUTER_ENV", "file with OPENROUTER_API_KEY"),
+}
+SOURCES = {"hermes": "Hermes", "local": "This Mac"}
+SLUGS = {"claude": "anthropic", "codex": "openai-codex", "opencode": "opencode", "antigravity": "antigravity",
+         "openrouter": "openrouter"}
+
+
+@functools.lru_cache(maxsize=None)
+def app_settings():
+    try:
+        out = subprocess.run(["defaults", "export", DEFAULTS, "-"], capture_output=True, timeout=5)
+        settings = plistlib.loads(out.stdout) if out.returncode == 0 and out.stdout.strip() else {}
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return {}
+    return settings if isinstance(settings, dict) else {}
+
+
+def app_setting(key):
+    return app_settings().get(key)
+
+
+def as_path(value):
+    value = value.strip() if isinstance(value, str) else ""
+    return Path(os.path.abspath(os.path.expanduser(value))) if value else None
+
+
+def hermes_folder(path):
+    return path.parent.parent if path.parent.name.lower() == "profiles" else path
+
+
+def automatic_location(key):
+    env = os.environ
+    if key == "hermes":
+        home = as_path(env.get("HERMES_HOME"))
+        return (hermes_folder(home), "HERMES_HOME") if home else (HOME / ".hermes", "default")
+    if key == "claude":
+        folder = as_path(env.get("CLAUDE_CONFIG_DIR"))
+        return (folder, "CLAUDE_CONFIG_DIR") if folder else (HOME / ".claude", "default")
+    if key == "codex":
+        folder = as_path(env.get("CODEX_HOME"))
+        return (folder, "CODEX_HOME") if folder else (HOME / ".codex", "default")
+    if key == "opencode":
+        data = as_path(env.get("XDG_DATA_HOME"))
+        return (data / "opencode", "XDG_DATA_HOME") if data else (HOME / ".local/share/opencode", "default")
+    if key == "antigravity":
+        return HOME / ".gemini/antigravity-cli", "default"
+    return location("hermes")[0] / ".env", "Hermes home"
+
+
+@functools.lru_cache(maxsize=None)
+def location(key):
+    variable = LOCATIONS[key][1]
+    for origin, value in ((variable, os.environ.get(variable)), ("custom", app_setting(f"location.{key}"))):
+        path = as_path(value)
+        if path:
+            return (hermes_folder(path) if key == "hermes" else path), origin, True
+    return (*automatic_location(key), False)
+
+
+def hermes_root():
+    return location("hermes")[:2]
+
+
+def helper_env():
+    env = dict(os.environ)
+    for key, (_, variable, _) in LOCATIONS.items():
+        path, _, custom = location(key)
+        if custom or key == "hermes":
+            env[variable] = str(path)
+        else:
+            env.pop(variable, None)
+    return env
+
+
+def claude_services(folder):
+    base = "Claude Code-credentials"
+    path = unicodedata.normalize("NFC", str(folder))
+    hashed = [base + "-" + hashlib.sha256(text.encode()).hexdigest()[:8] for text in (path, path + "/")]
+    return [base, hashed[0]] if folder == HOME / ".claude" else hashed
+
+
+def keychain_has(service, account=None):
+    try:
+        out = subprocess.run(["security", "find-generic-password", "-s", service] + (["-a", account] if account else []),
+                             capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.returncode == 0
+
+
+def env_file_has(path, name):
+    try:
+        lines = path.read_text().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return False
+    for line in lines:
+        line = line.strip()
+        if line.startswith(name + "=") and not line.startswith("#"):
+            value = line.split("=", 1)[1].strip().strip('"').strip("'")
+            if value and value != "CHANGEME":
+                return True
+    return False
+
+
+def location_status(key, path, custom):
+    folder = path.is_dir()
+    if key == "openrouter":
+        if not custom and (os.environ.get("OPENROUTER_API_KEY") or "").strip():
+            return "ok", "Using OPENROUTER_API_KEY from the environment."
+        if env_file_has(path, "OPENROUTER_API_KEY"):
+            return "ok", "OPENROUTER_API_KEY found."
+        if not custom:
+            return "info", "No OPENROUTER_API_KEY found."
+        return "warn", "No OPENROUTER_API_KEY in this file." if path.is_file() else "This file doesn't exist."
+    if custom and not folder:
+        return "warn", "This folder doesn't exist."
+    unset = ("info", "Not set up on this Mac.")
+    if key == "hermes":
+        if not folder:
+            return unset
+        good, text = hermes_status(path)
+        return ("ok" if good else "warn"), text
+    if key == "claude":
+        service = next((name for name in claude_services(path) if keychain_has(name)), None)
+        if service:
+            return "ok", f"Signed in (Keychain: {service})."
+        try:
+            oauth = json.loads((path / ".credentials.json").read_text()).get("claudeAiOauth")
+        except (OSError, ValueError, AttributeError):
+            oauth = None
+        if isinstance(oauth, dict) and str(oauth.get("accessToken") or "").strip():
+            return "ok", "Signed in (.credentials.json)."
+        return ("warn", "No Claude Code login here. Run claude and sign in.") if folder else unset
+    if key == "codex":
+        if (path / "auth.json").is_file():
+            return "ok", "Signed in (auth.json)."
+        if not custom and (HOME / ".config/goose/chatgpt_codex/tokens.json").is_file():
+            return "ok", "Signed in (Goose)."
+        return ("warn", "No auth.json here. Run codex login.") if folder else unset
+    if key == "opencode":
+        try:
+            entry = json.loads((path / "auth.json").read_text()).get("openrouter")
+        except (OSError, ValueError, AttributeError):
+            entry = None
+        if isinstance(entry, dict) and str(entry.get("key") or "").strip():
+            return "ok", "Signed in (auth.json)."
+        return ("info", "Not signed in. Run opencode auth login.") if folder else unset
+    if (path / "antigravity-oauth-token").is_file():
+        return "ok", "Signed in (antigravity-oauth-token)."
+    if not custom and keychain_has("gemini", "antigravity"):
+        return "ok", "Signed in (Keychain)."
+    return ("info", "Not signed in. Run agy to sign in.") if folder else unset
+
+
+def notify_app():
+    if DEFAULTS != LABEL:
+        return
+    try:
+        ctypes.CDLL("/usr/lib/libSystem.B.dylib").notify_post(SETTINGS_CHANGED.encode())
+    except (OSError, AttributeError):
+        pass
+
+
+def desktop_store(root=None):
+    root = root or hermes_root()[0]
+    return root / "gateway-connections.json", root / "gateway-connection-tokens.json"
 
 
 def paint(text, code):
@@ -54,16 +234,8 @@ def helper_path(name):
     return None
 
 
-def defaults_read(key):
-    try:
-        out = subprocess.run(["defaults", "read", LABEL, key], capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return out.stdout.strip() if out.returncode == 0 else None
-
-
 def enabled_sources():
-    enabled = [kind for kind in HELPERS if defaults_read(f"gatewayEnabled.{kind}") == "1"]
+    enabled = [kind for kind in HELPERS if app_setting(f"gatewayEnabled.{kind}") in (True, 1)]
     return enabled or ["hermes"]
 
 
@@ -73,7 +245,7 @@ def run_helper(kind, timeout):
         return {"source": kind, "helper": None, "exit": 127, "seconds": 0.0, "stderr": f"{HELPERS[kind]} is not installed", "payload": None}
     start = time.monotonic()
     try:
-        proc = subprocess.run([str(path)], capture_output=True, timeout=timeout)
+        proc = subprocess.run([str(path)], capture_output=True, timeout=timeout, env=helper_env())
         code, out, err = proc.returncode, proc.stdout, proc.stderr.decode(errors="replace").strip()
     except subprocess.TimeoutExpired:
         code, out, err = 124, b"", f"timed out after {timeout:g}s"
@@ -285,19 +457,271 @@ def tail(path, lines):
     return data[-lines:]
 
 
-def hermes_connection():
+def hermes_connection(root=None):
+    registry = desktop_store(root)[0]
+    legacy = SUPPORT / "connections.json"
     try:
-        conns = json.loads((SUPPORT / "connections.json").read_text())
+        conns = json.loads((registry if registry.exists() else legacy).read_text())
     except (OSError, ValueError):
-        return None, None
+        return None, None, None
     entries = [entry for entry in (conns.get("connections") or []) if isinstance(entry, dict)]
     by_id = {entry.get("id"): entry for entry in entries}
     ordered = [entry for entry in (by_id.get(conns.get("lastUsed")), by_id.get(conns.get("primary"))) if entry] + entries
     active = next((entry for entry in ordered if entry.get("kind") != "local" and entry.get("url")), None) \
         or (ordered[0] if ordered else None)
     if not isinstance(active, dict):
-        return None, None
-    return active.get("kind"), (active.get("url") or "").rstrip("/") or None
+        return None, None, None
+    return active.get("kind"), (active.get("url") or "").rstrip("/") or None, active.get("id")
+
+
+def url_key(value):
+    parts = urllib.parse.urlsplit(str(value or "").strip())
+    return "%s://%s%s" % (parts.scheme.lower(), parts.netloc.rpartition("@")[2].lower(), parts.path.rstrip("/"))
+
+
+def desktop_session(conn_id, url, root=None):
+    registry, tokens = desktop_store(root)
+    migrated = registry.exists()
+    path = tokens if migrated else SUPPORT / "native-oauth-tokens.json"
+    try:
+        store = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return path, None
+    key = url_key(url)
+    if not migrated:
+        return path, next((v for k, v in store.items() if url_key(k) == key), None)
+    bound = store.get("tokens") or {}
+    for entry in [bound.get(conn_id)] + list(bound.values()):
+        if isinstance(entry, dict) and url_key(entry.get("baseUrl")) == key:
+            return path, entry
+    for section in ("unbound", "undecrypted"):
+        found = next((v for k, v in (store.get(section) or {}).items() if url_key(k) == key), None)
+        if found:
+            return path, found
+    return path, None
+
+
+def span(seconds):
+    hours, minutes = divmod(int(seconds) // 60, 60)
+    return f"{hours}h {minutes}m" if hours else f"{minutes}m"
+
+
+def hermes_status(home):
+    if not home.is_dir():
+        return False, "This folder doesn't exist."
+    older = "" if desktop_store(home)[0].exists() else " (older Hermes Desktop files)"
+    kind, url, conn_id = hermes_connection(home)
+    if kind is None:
+        return False, "No Hermes Desktop connection found here."
+    if kind == "local" or not url:
+        return True, f"Hermes Desktop uses This device{older}."
+    name = url_key(url).split("://", 1)[-1]
+    session = desktop_session(conn_id, url, home)[1]
+    if not isinstance(session, dict):
+        return False, f"{name}: not signed in. Sign in from Hermes Desktop{older}."
+    saved = session
+    if session.get("encoding") == "plain":
+        try:
+            saved = json.loads(session.get("value") or "")
+        except ValueError:
+            saved = session
+    expires = saved.get("expiresAt") if isinstance(saved, dict) else None
+    if isinstance(expires, (int, float)) and not isinstance(expires, bool) \
+            and (expires / 1000 if expires > 1e12 else expires) < time.time():
+        return False, f"{name}: sign-in expired. Open Hermes Desktop to renew it{older}."
+    return True, f"{name}: signed in{older}."
+
+
+def shown(path):
+    text = str(path)
+    return "~" + text[len(str(HOME)):] if text == str(HOME) or text.startswith(str(HOME) + "/") else text
+
+
+def mode_text(origin, custom):
+    if origin == "custom":
+        return "custom"
+    if custom:
+        return f"custom, {origin}"
+    return "automatic" if origin == "default" else f"automatic, {origin}"
+
+
+def source_on(source):
+    return app_setting(f"gatewayEnabled.{source}") in (True, 1)
+
+
+def provider_on(source, slug):
+    return app_setting(f"menuBarHidden.{source}:{slug}") not in (True, 1)
+
+
+def hermes_providers():
+    slugs, labels = app_setting("lastProviderSlugs.hermes"), app_setting("lastProviderLabels.hermes")
+    if not isinstance(slugs, list) or not isinstance(labels, list):
+        return []
+    return [(slug, label) for slug, label in zip(slugs, labels) if isinstance(slug, str) and isinstance(label, str)]
+
+
+def config_target(value):
+    if value in LOCATIONS or value in SOURCES:
+        return value
+    if value.startswith("hermes:"):
+        slug = value.split(":", 1)[1]
+        known = [known for known, _ in hermes_providers()]
+        if slug in known:
+            return value
+        hint = "Hermes lists " + ", ".join(f"hermes:{name}" for name in known) if known \
+            else "Hermes hasn't listed its providers yet"
+        raise argparse.ArgumentTypeError(f"no Hermes provider named '{slug}' ({hint})")
+    names = ", ".join(["hermes", "local"] + [key for key in LOCATIONS if key != "hermes"])
+    raise argparse.ArgumentTypeError(f"invalid choice: '{value}' (choose from {names} or hermes:<provider>)")
+
+
+def location_record(key):
+    path, origin, custom = location(key)
+    state, text = location_status(key, path, custom)
+    source = "hermes" if key == "hermes" else "local"
+    return {"provider": key, "label": LOCATIONS[key][0], "source": source,
+            "on": source_on(source) if key == "hermes" else provider_on(source, SLUGS[key]),
+            "set_up": custom or state != "info", "mode": "custom" if custom else "automatic",
+            "origin": origin, "path": str(path), "state": state, "status": text}
+
+
+def config_record(target):
+    if target in LOCATIONS:
+        return location_record(target)
+    if target == "local":
+        return {"provider": "local", "label": SOURCES["local"], "source": "local", "on": source_on("local")}
+    slug = target.split(":", 1)[1]
+    return {"provider": target, "label": dict(hermes_providers()).get(slug, slug), "source": "hermes",
+            "on": provider_on("hermes", slug)}
+
+
+def config_records():
+    return ([config_record("hermes")] + [config_record(f"hermes:{slug}") for slug, _ in hermes_providers()]
+            + [config_record("local")] + [config_record(key) for key in LOCATIONS if key != "hermes"])
+
+
+def save_settings(changes):
+    for key, value in changes.items():
+        if value is None:
+            command = ["defaults", "delete", DEFAULTS, key]
+        elif isinstance(value, bool):
+            command = ["defaults", "write", DEFAULTS, key, "-bool", "true" if value else "false"]
+        else:
+            command = ["defaults", "write", DEFAULTS, key, "-string", value]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+        if value is not None and result.returncode != 0:
+            raise OSError(result.stderr.strip() or f"defaults exited {result.returncode}")
+    app_settings.cache_clear()
+    location.cache_clear()
+    notify_app()
+
+
+def config_change(args):
+    given = [name for name, value in (("path", args.path is not None), ("automatic", args.automatic),
+                                      ("on", args.on), ("off", args.off)) if value]
+    if len(given) > 1:
+        return None, "give only one of <path>, --automatic, --on or --off"
+    if given and not args.provider:
+        return None, "name the provider to change"
+    if not given:
+        return {}, None
+    target = args.provider
+    if given[0] in ("path", "automatic"):
+        if target == "local":
+            return None, "local has no location of its own; set one for each provider"
+        if target not in LOCATIONS:
+            return None, f"{target} is read through Hermes; set the Hermes home instead"
+        path = as_path(args.path) if given[0] == "path" else None
+        changes = {f"location.{target}": str(path) if path else None}
+        if path and target in SLUGS and not provider_on("local", SLUGS[target]):
+            changes[f"menuBarHidden.local:{SLUGS[target]}"] = False
+        return changes, None
+    if target in SOURCES:
+        return {f"gatewayEnabled.{target}": args.on}, None
+    source, slug = target.split(":", 1) if ":" in target else ("local", SLUGS[target])
+    return {f"menuBarHidden.{source}:{slug}": not args.on}, None
+
+
+def print_config(records):
+    marks = {"ok": ok("✓"), "warn": warn("!"), "info": dim("·")}
+    rows = [record for record in records if record["provider"] not in ("local",)]
+    places = [record for record in rows if "path" in record]
+    names = max((len(record["provider"]) for record in rows), default=0)
+    modes = max((len(mode_text(record["origin"], record["mode"] == "custom")) for record in places), default=0)
+    paths = max((len(shown(record["path"])) for record in places), default=0)
+    groups = [(source, [record for record in records if record["source"] == source]) for source in SOURCES]
+    first = True
+    for source, members in groups:
+        if not members:
+            continue
+        missing = [record for record in members if "path" in record and source == "local" and not record["set_up"]
+                   and len(records) > 1]
+        if not first:
+            print()
+        first = False
+        state = ok("on") if source_on(source) else dim("off")
+        print(paint(f"{SOURCES[source]} ({source})", "1") + f": {state}")
+        for record in members:
+            if record["provider"] == "local" or record in missing:
+                continue
+            switch = "   " if record["provider"] == "hermes" else (ok("on ") if record["on"] else dim("off"))
+            line = f"  {switch}  {record['provider']:<{names}}"
+            if "path" in record:
+                mode = mode_text(record["origin"], record["mode"] == "custom")
+                line += f"  {mode:<{modes}}  {shown(record['path']):<{paths}}  {marks[record['state']]} {record['status']}"
+            else:
+                line += f"  {record['label']}"
+            print(line.rstrip())
+        if missing:
+            print(dim("  Not set up on this Mac: " + ", ".join(
+                f"{record['provider']} ({shown(record['path'])})" for record in missing)))
+
+
+def cmd_config(args):
+    changes, problem = config_change(args)
+    if problem:
+        print(f"provider-quotas config: {problem}", file=sys.stderr)
+        return 2
+    if changes:
+        try:
+            save_settings(changes)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"provider-quotas config: could not save the setting: {exc}", file=sys.stderr)
+            return 1
+    records = [config_record(args.provider)] if args.provider else config_records()
+    if args.json:
+        print(json.dumps(records[0] if args.provider else records, indent=2))
+        return 0
+    if args.provider in SOURCES:
+        records = [record for record in config_records() if record["source"] == args.provider]
+    print_config(records)
+    target = args.provider
+    turned_on = bool(changes) and (args.on or args.path is not None) and target in SLUGS
+    if turned_on and not source_on("local"):
+        print(warn("\nThis Mac is off, so nothing from it shows yet. Turn it on: provider-quotas config local --on"))
+    for record in records:
+        variable = LOCATIONS.get(record["provider"], (None, None))[1]
+        if variable and record.get("origin") == variable:
+            print(warn(f"\n{variable} is set in this shell, so it wins here; the menu app uses its own setting."))
+    print(dim("\nChange one:      provider-quotas config <provider> <path>"))
+    print(dim("Back to default: provider-quotas config <provider> --automatic"))
+    print(dim("Show or hide:    provider-quotas config <provider> --on | --off   (hermes or local turns a whole source)"))
+    print(dim("The same choices are in the menu: gear button → Settings."))
+    return 0
+
+
+def session_check(path, session):
+    where = str(path).replace(str(HOME), "~", 1)
+    if not isinstance(session, dict):
+        return check("Hermes Desktop session", "fail", f"missing from {where} — sign in to Hermes Desktop")
+    expires = session.get("expiresAt")
+    if isinstance(expires, bool) or not isinstance(expires, (int, float)):
+        return check("Hermes Desktop session", "ok", f"saved for this gateway in {where}")
+    left = (expires / 1000 if expires > 1e12 else expires) - time.time()
+    if left > 0:
+        return check("Hermes Desktop session", "ok", f"saved for this gateway in {where}, access token valid {span(left)}")
+    return check("Hermes Desktop session", "warn",
+                 f"saved in {where}, but its access token expired {span(-left)} ago — Hermes Desktop renews it while running")
 
 
 def gateway_reachable(url, timeout):
@@ -334,8 +758,8 @@ def cmd_doctor(args):
         states.append(check("app bundle", "ok", f"{app} (built {built})"))
     if not apps:
         states.append(check("app bundle", "fail", "Provider Quotas.app not found"))
-    repo = defaults_read("sourceRepo")
-    if repo:
+    repo = app_setting("sourceRepo")
+    if isinstance(repo, str) and repo:
         head = subprocess.run(["git", "-C", repo, "log", "-1", "--format=%h %s"], capture_output=True, text=True, timeout=10)
         branch = subprocess.run(["git", "-C", repo, "branch", "--show-current"], capture_output=True, text=True, timeout=10)
         detail = f"{repo} ({branch.stdout.strip() or 'detached'} @ {head.stdout.strip()})" if head.returncode == 0 else f"{repo} (not a git checkout)"
@@ -356,21 +780,21 @@ def cmd_doctor(args):
     states.append(check("menu-bar process", "ok" if procs else "fail", f"pid {', '.join(procs)}" if procs else "not running"))
 
     print(paint("\nSources", "1"))
-    enabled = [kind for kind in HELPERS if defaults_read(f"gatewayEnabled.{kind}") == "1"]
+    enabled = [kind for kind in HELPERS if app_setting(f"gatewayEnabled.{kind}") in (True, 1)]
     states.append(check("enabled in menu", "ok" if enabled else "warn", ", ".join(enabled) if enabled else "none (open the menu → Sources)"))
-    kind, url = hermes_connection()
+    root, origin, custom = location("hermes")
+    state, text = location_status("hermes", root, custom)
+    if state == "info" and "hermes" in enabled:
+        state, text = "warn", "This folder doesn't exist. Set it in the menu's Settings or with provider-quotas config hermes <path>."
+    states.append(check("Hermes home", state, f"{shown(root)} ({mode_text(origin, custom)}) — {text}"))
+    kind, url, conn_id = hermes_connection()
     if kind is None:
         states.append(check("Hermes Desktop connection", "warn" if "hermes" in enabled else "info", "not configured"))
     elif kind == "local":
         states.append(check("Hermes Desktop connection", "info", "local backend"))
     else:
         states.append(check("Hermes Desktop connection", "info", f"{kind} {url}"))
-        try:
-            tokens = json.loads((SUPPORT / "native-oauth-tokens.json").read_text())
-            signed_in = any(str(key).strip("/") == url.strip("/") for key in tokens)
-        except (OSError, ValueError, AttributeError):
-            signed_in = False
-        states.append(check("Hermes Desktop session", "ok" if signed_in else "fail", "saved for this gateway" if signed_in else "missing — sign in to Hermes Desktop"))
+        states.append(session_check(*desktop_session(conn_id, url)))
         if url:
             status, elapsed = gateway_reachable(url, args.timeout)
             reachable = isinstance(status, int) and status < 500
@@ -392,6 +816,14 @@ def cmd_doctor(args):
         for provider in providers:
             if provider.get("status") != "ok" and provider.get("message"):
                 states.append(check(provider.get("label") or provider.get("provider"), "warn", provider["message"]))
+
+    print(paint("\nProvider locations", "1"))
+    for key in LOCATIONS:
+        if key == "hermes":
+            continue
+        path, origin, custom = location(key)
+        state, text = location_status(key, path, custom)
+        states.append(check(LOCATIONS[key][0], state, f"{shown(path)} ({mode_text(origin, custom)}) — {text}"))
 
     logs = log_files()
     print(paint("\nLogs", "1"))
@@ -448,11 +880,31 @@ def main():
     doctor.add_argument("--log-lines", type=int, default=5, help="recent log lines to show per file (default 5)")
     logs = sub.add_parser("logs", help="print recent menu-bar app logs")
     logs.add_argument("-n", "--lines", type=int, default=40, help="lines per log file (default 40)")
+    config = sub.add_parser(
+        "config", help="show or set which providers are read and shown, and where from",
+        description="Show or set which providers Provider Quotas reads and shows as activity, and where each one's "
+                    "sign-in is read from. Automatic uses the provider's standard location; a path makes it custom. "
+                    "The menu's Settings window shows the same choices.",
+        epilog="examples:\n  provider-quotas config\n  provider-quotas config claude ~/work/.claude\n"
+               "  provider-quotas config claude --automatic\n  provider-quotas config openrouter ~/keys/openrouter.env\n"
+               "  provider-quotas config codex --off\n  provider-quotas config local --on\n"
+               "  provider-quotas config hermes:copilot --off",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    config.add_argument("provider", nargs="?", type=config_target, metavar="provider",
+                        help="hermes or local (a whole source), a provider on this Mac (claude, codex, opencode, "
+                             "antigravity, openrouter), or hermes:<provider>")
+    config.add_argument("path", nargs="?", help="folder to read instead (a file holding OPENROUTER_API_KEY for openrouter)")
+    config.add_argument("--automatic", action="store_true", help="go back to the provider's automatic location")
+    config.add_argument("--on", action="store_true", help="read it and show it as activity")
+    config.add_argument("--off", action="store_true", help="stop showing it (for hermes or local, stop reading the source)")
+    config.add_argument("--json", action="store_true", help="print the settings as JSON")
     args = parser.parse_args()
     if args.command == "doctor":
         return cmd_doctor(args)
     if args.command == "logs":
         return cmd_logs(args)
+    if args.command == "config":
+        return cmd_config(args)
     return cmd_status(args)
 
 

@@ -77,6 +77,8 @@ done
 if pgrep -f "$binary_target" >/dev/null 2>&1; then
     echo "✓ Provider Quotas is running — its icon is in the menu bar (top-right)."
     echo "  Click it, then turn on Hermes and/or Local under \"Sources\"."
+    echo "  To read a provider from another folder: the gear (Settings) button, or"
+    echo "  provider-quotas config <provider> <path>"
 else
     echo "⚠ It didn't start — check ~/.hermes/logs/provider-quotas-error.log" >&2
 fi

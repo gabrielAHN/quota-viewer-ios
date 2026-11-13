@@ -10,10 +10,24 @@
 # on any failure prints a one-line reason to stderr and exits non-zero.
 set -euo pipefail
 exec /usr/bin/env python3 - "$@" <<'PY'
-import base64, hashlib, json, subprocess, sys, time, urllib.request, urllib.error
+import base64, hashlib, json, os, subprocess, sys, time, urllib.parse, urllib.request, urllib.error
 from pathlib import Path
 
 SUPPORT = Path.home() / "Library/Application Support/Hermes"
+
+
+def _hermes_root():
+    home = (os.environ.get("PROVIDER_QUOTAS_HERMES_HOME") or os.environ.get("HERMES_HOME") or "").strip()
+    if not home:
+        return Path.home() / ".hermes"
+    path = Path(os.path.abspath(os.path.expanduser(home)))
+    return path.parent.parent if path.parent.name.lower() == "profiles" else path
+
+
+STORE = _hermes_root()
+REGISTRY = STORE / "gateway-connections.json"
+TOKENS = STORE / "gateway-connection-tokens.json"
+MIGRATED = REGISTRY.exists()
 # Optional args: $1 = gateway endpoint path (default: the quotas endpoint),
 # $2 = output file for binary bodies (e.g. a pet spritesheet); otherwise the
 # body is written to stdout.
@@ -46,14 +60,34 @@ def emit(data):
         sys.stdout.buffer.write(data)
 
 
-def read_json(name):
+def read_json(path):
     for delay in (0, 0.05, 0.1, 0.2):
         if delay:
             time.sleep(delay)
         try:
-            return json.loads((SUPPORT / name).read_text())
+            return json.loads(path.read_text().lstrip("\ufeff"))
         except (OSError, ValueError):
             continue
+    return None
+
+
+def url_key(value):
+    parts = urllib.parse.urlsplit(str(value or "").strip())
+    return "%s://%s%s" % (parts.scheme.lower(), parts.netloc.rpartition("@")[2].lower(), parts.path.rstrip("/"))
+
+
+def saved_session(store, conn_id, url):
+    key = url_key(url)
+    if not MIGRATED:
+        return next((v for k, v in store.items() if url_key(k) == key), None)
+    bound = store.get("tokens") or {}
+    for entry in [bound.get(conn_id)] + list(bound.values()):
+        if isinstance(entry, dict) and url_key(entry.get("baseUrl")) == key:
+            return entry
+    for section in ("unbound", "undecrypted"):
+        found = next((v for k, v in (store.get(section) or {}).items() if url_key(k) == key), None)
+        if found:
+            return found
     return None
 
 
@@ -91,7 +125,7 @@ def _spawned_local_backend():
     serve runs with --port 0) -> the token from that process's OWN environment.
     This is the macOS path (ps eww / lsof over our own uid)."""
     import re
-    own = read_json("backend-ownership.json") or {}
+    own = read_json(SUPPORT / "backend-ownership.json") or {}
     for backend in own.get("backends") or []:
         pid = backend.get("pid")
         base = (backend.get("url") or backend.get("baseUrl") or "").rstrip("/")
@@ -145,13 +179,13 @@ def gateway_connection(conns):
 fetch = None
 EXPIRED_MSG = "Hermes gateway returned HTTP %s."
 try:
-    active = gateway_connection(read_json("connections.json") or {})
+    active = gateway_connection(read_json(REGISTRY if MIGRATED else SUPPORT / "connections.json") or {})
 
     if isinstance(active, dict):
         kind = active.get("kind")
         url = (active.get("url") or "").rstrip("/")
     else:
-        legacy = read_json("connection.json") or {}
+        legacy = read_json(SUPPORT / "connection.json") or {}
         kind = legacy.get("mode")
         url = ""
         if kind and kind != "local":
@@ -159,9 +193,6 @@ try:
 
     if not kind:
         fail("Hermes Desktop is not set up.")
-
-    def _norm(value):
-        return value.strip().strip("/")
 
     # --- Build a `fetch(path) -> (status, body)` bound to the gateway the Desktop is
     # bound to: the Desktop-spawned local backend (local mode) authenticates with its
@@ -185,17 +216,20 @@ try:
 
         def desktop_access_token():
             global _ss_key
-            tokens = read_json("native-oauth-tokens.json")
+            store_file = TOKENS if MIGRATED else SUPPORT / "native-oauth-tokens.json"
+            tokens = read_json(store_file)
             if tokens is None:
-                if not (SUPPORT / "native-oauth-tokens.json").exists():
+                if not store_file.exists():
                     fail("Sign in to Hermes Desktop.", 2)
                 fail("Cannot read Hermes Desktop session — retrying.")
-            entry = tokens.get(url) or next((v for k, v in tokens.items() if _norm(k) == _norm(url)), None)
-            if not entry:
+            entry = saved_session(tokens, active.get("id") if isinstance(active, dict) else None, url)
+            if not isinstance(entry, dict):
                 fail("Sign in to Hermes Desktop (%s)." % url, 2)
             value = entry.get("value") or ""
             try:
-                if entry.get("encoding") == "safeStorage":
+                if "encoding" not in entry:
+                    session = entry
+                elif entry.get("encoding") == "safeStorage":
                     if _ss_key is None:
                         secret = subprocess.check_output(
                             ["security", "find-generic-password", "-s", "Hermes Safe Storage", "-w"],

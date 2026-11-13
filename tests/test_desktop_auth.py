@@ -58,8 +58,12 @@ class DesktopAuthTests(unittest.TestCase):
             "accessToken": access, "refreshToken": "desktop-owned-refresh", "expiresAt": expires
         })}}))
 
-    def run_reader(self, *args):
-        return subprocess.run(["/bin/bash", str(READER), *args], env={**os.environ, "HOME": self.home.name},
+    def env(self, **extra):
+        env = {k: v for k, v in os.environ.items() if k not in ("HERMES_HOME", "PROVIDER_QUOTAS_HERMES_HOME")}
+        return {**env, "HOME": self.home.name, **extra}
+
+    def run_reader(self, *args, **env):
+        return subprocess.run(["/bin/bash", str(READER), *args], env=self.env(**env),
                               capture_output=True, text=True, timeout=15)
 
     def test_valid_desktop_access_is_used_without_rotating_shared_refresh(self):
@@ -125,7 +129,7 @@ class DesktopAuthTests(unittest.TestCase):
         started = time.monotonic()
         try:
             result = subprocess.run(["/bin/bash", str(READER)],
-                env={**os.environ, "HOME": self.home.name}, capture_output=True, text=True, timeout=7)
+                env=self.env(), capture_output=True, text=True, timeout=7)
         except subprocess.TimeoutExpired:
             self.fail("Unresponsive gateway kept the quota reader running beyond seven seconds")
         finally:
@@ -267,6 +271,85 @@ class DesktopAuthTests(unittest.TestCase):
         result = self.run_reader()
         self.assertEqual(result.returncode, 1)
         self.assertNotIn("expired", result.stderr)
+
+    def write_store(self, root=None, **sections):
+        root = Path(root or Path(self.home.name) / ".hermes")
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "gateway-connections.json").write_text(json.dumps({
+            "version": 2, "primary": "gateway", "lastUsed": "local", "launchMode": "last-used", "revision": 3,
+            "connections": [{"id": "local", "kind": "local", "label": "This device"},
+                            {"id": "gateway", "kind": "remote", "url": self.url, "authMode": "oauth"}]}))
+        tokens = root / "gateway-connection-tokens.json"
+        if sections:
+            tokens.write_text(json.dumps({"version": 1, "revision": 2, "tokens": {}, "unbound": {},
+                                          "undecrypted": {}, **sections}))
+        elif tokens.exists():
+            tokens.unlink()
+        return root
+
+    def store_set(self, access, base=None):
+        return {"accessToken": access, "refreshToken": "desktop-owned-refresh", "provider": "self-hosted",
+                "expiresAt": int((time.time() + 3600) * 1000), "baseUrl": base or self.url}
+
+    def test_migrated_desktop_store_wins_over_stale_legacy_files(self):
+        self.save_session("stale-legacy-access", time.time() - 60)
+        (self.support / "connections.json").write_text(json.dumps({
+            "primary": "old", "connections": [{"id": "old", "kind": "remote", "url": "http://127.0.0.1:9"}]}))
+        store = self.write_store(tokens={"gateway": self.store_set("store-access")})
+        before = {p.name: p.read_bytes() for p in store.iterdir()}
+        result = self.run_reader()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([r[1:] for r in self.requests], [("/api/plugins/provider-quota/quotas", "Bearer store-access")])
+        self.assertEqual({p.name: p.read_bytes() for p in store.iterdir()}, before)
+
+    def test_migrated_store_without_this_gateway_needs_sign_in_despite_legacy_tokens(self):
+        for sections in ({}, {"tokens": {"gateway": self.store_set("elsewhere", base="https://other.test/hermes")}}):
+            with self.subTest(sections=sections):
+                self.write_store(**sections)
+                result = self.run_reader()
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("Sign in to Hermes Desktop", result.stderr)
+                self.assertEqual(self.requests, [])
+
+    def test_migrated_store_reads_unbound_and_undecrypted_sign_ins(self):
+        cases = [("unbound", {self.url + "/": self.store_set("unbound-access")}, "unbound-access"),
+                 ("undecrypted", {self.url: {"encoding": "plain", "value": json.dumps(self.store_set("envelope-access"))}},
+                  "envelope-access")]
+        for section, entries, access in cases:
+            with self.subTest(section=section):
+                self.requests.clear()
+                self.write_store(**{section: entries})
+                result = self.run_reader()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.requests[0][2], "Bearer " + access)
+
+    def test_profile_hermes_home_reads_the_root_store(self):
+        root = Path(self.home.name) / "custom-hermes"
+        self.write_store(root=root, tokens={"gateway": self.store_set("root-access")})
+        result = self.run_reader(HERMES_HOME=str(root / "profiles" / "carto"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.requests[0][2], "Bearer root-access")
+
+    def test_hermes_home_chosen_in_the_app_wins_over_hermes_home(self):
+        chosen = self.write_store(root=Path(self.home.name) / "chosen", tokens={"gateway": self.store_set("chosen-access")})
+        self.write_store(tokens={"gateway": self.store_set("env-access")})
+        result = self.run_reader(PROVIDER_QUOTAS_HERMES_HOME=str(chosen),
+                                 HERMES_HOME=str(Path(self.home.name) / ".hermes"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([r[2] for r in self.requests], ["Bearer chosen-access"])
+
+    def test_adopts_desktop_rotation_in_the_store_after_unauthorized(self):
+        self.write_store(tokens={"gateway": self.store_set("store-access")})
+
+        def respond(handler):
+            if handler.headers.get("Authorization") == "Bearer store-access":
+                self.write_store(tokens={"gateway": self.store_set("rotated-in-store")})
+                return 401, {}
+            return 200, {"providers": [{"provider": "test", "status": "ok"}]}
+        self.on_get = respond
+        result = self.run_reader()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([r[2] for r in self.requests], ["Bearer store-access", "Bearer rotated-in-store"])
 
 
 if __name__ == "__main__":

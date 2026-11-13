@@ -1,5 +1,8 @@
 import AppKit
+import CryptoKit
 import Foundation
+import notify
+import Security
 import SQLite3
 
 struct QuotaPayload: Decodable {
@@ -500,7 +503,9 @@ enum PetCatalog {
         var pets: [PetInfo] = []
         var seen = Set<String>()
         // Local pets dir wins over the gateway cache (scanned first).
-        for base in [petsDir, cacheDir] {
+        let homePets = AppDelegate.location("hermes").url.appendingPathComponent("pets")
+        let bases = homePets.standardizedFileURL == petsDir.standardizedFileURL ? [petsDir, cacheDir] : [homePets, petsDir, cacheDir]
+        for base in bases {
             guard let entries = try? fm.contentsOfDirectory(
                 at: base, includingPropertiesForKeys: [.isDirectoryKey]
             ) else { continue }
@@ -518,11 +523,10 @@ enum PetCatalog {
                 guard fm.fileExists(atPath: sheet.path) else { continue }
                 seen.insert(id)
                 let display = (obj["displayName"] as? String) ?? id.capitalized
-                // Thumbnails: local catalog first, then a cached copy.
-                let localThumb = petsDir.appendingPathComponent(".thumbs/\(id).png")
-                let cacheThumb = dir.appendingPathComponent("thumbnail.png")
-                let thumb = fm.fileExists(atPath: localThumb.path) ? localThumb
-                    : (fm.fileExists(atPath: cacheThumb.path) ? cacheThumb : nil)
+                // Thumbnails: the pet's own catalog first, then the local one, then a cached copy.
+                let thumb = [base.appendingPathComponent(".thumbs/\(id).png"),
+                             petsDir.appendingPathComponent(".thumbs/\(id).png"),
+                             dir.appendingPathComponent("thumbnail.png")].first { fm.fileExists(atPath: $0.path) }
                 pets.append(PetInfo(id: id, displayName: display, spritesheetURL: sheet, thumbnailURL: thumb))
             }
         }
@@ -1286,6 +1290,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var refreshing = false
     private var timer: Timer?
     private var authRefreshTimers: [Timer] = []
+    private var settingsWindow: SettingsWindowController?
+    private var settingsNotifyToken: Int32 = 0
+    private var appliedGateways: Set<GatewayKind> = []
     private var signalSource: DispatchSourceSignal?
     // Providers whose detail is expanded (collapsed by default → brief row with a
     // bar; click to expand for per-window info). Session-scoped.
@@ -1404,6 +1411,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         source.resume()
         signalSource = source
+        appliedGateways = Set(enabledGateways())
+        notify_register_dispatch(Self.settingsChangedNotification, &settingsNotifyToken, .main) { [weak self] _ in
+            self?.settingsChangedExternally()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -1987,10 +1998,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return nil
     }
 
-    // Read once: Claude's subscription from ~/.claude.json's oauthAccount. Maps the
+    // Claude's subscription from the Claude Code global config's oauthAccount
+    // (~/.claude.json, or .claude.json inside a custom Claude folder). Maps the
     // organizationType / seatTier / rate-limit tier to a short badge (Team, Max, Pro).
-    static let claudeSubscriptionLabel: String? = {
-        let path = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude.json")
+    private static var claudeSubscriptionCache: (path: String, label: String?)?
+
+    static var claudeSubscriptionLabel: String? {
+        let folder = location("claude").url
+        let home = URL(fileURLWithPath: NSHomeDirectory())
+        let file = folder.path == home.appendingPathComponent(".claude").path
+            ? home.appendingPathComponent(".claude.json") : folder.appendingPathComponent(".claude.json")
+        if let cached = claudeSubscriptionCache, cached.path == file.path {
+            return cached.label
+        }
+        let label = claudeSubscription(at: file)
+        claudeSubscriptionCache = (file.path, label)
+        return label
+    }
+
+    private static func claudeSubscription(at path: URL) -> String? {
         guard let data = try? Data(contentsOf: path),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let account = root["oauthAccount"] as? [String: Any] else { return nil }
@@ -2002,7 +2028,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if tier.contains("max") { return "Max" }
         if tier.contains("pro") { return "Pro" }
         return nil
-    }()
+    }
 
     // After each fetch, diff every connected+ok provider's exhaustion against the
     // last reading. A provider that WAS out of quota and now has some again just
@@ -2638,12 +2664,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenu()
         applyMenuWindowAppearance()   // retheme the open dropdown live
         updateActivityPets()
+        settingsWindow?.applyTheme()
     }
 
     private func actionBarView() -> NSView {
         let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 42))
-        // Right cluster: app-theme toggle, Check-for-Updates and Close. (The GitHub
-        // link is a small icon in the title header, next to the "Updated" time.)
+        // Right cluster: Settings, app-theme toggle, Check-for-Updates and Close. (The
+        // GitHub link is a small icon in the title header, next to the "Updated" time.)
+        let settings = iconActionButton(NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil),
+                                        label: "Settings", action: #selector(openSettings), glowColor: .hermesBlue)
+        settings.frame = NSRect(x: 218, y: 7, width: 28, height: 28)
+        view.addSubview(settings)
+
         let theme = iconActionButton(NSImage(systemSymbolName: appearanceSymbolName(), accessibilityDescription: nil),
                                      label: appearanceTooltip(),
                                      action: #selector(cycleAppearance), glowColor: .hermesBlue)
@@ -2672,6 +2704,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // The project's GitHub page.
     static let repoURL = "https://github.com/gabrielAHN/quota-viewer-ios"
+
+    @objc private func openSettings() {
+        menu.cancelTracking()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let controller = self.settingsWindow ?? SettingsWindowController(model: self.settingsModel())
+            self.settingsWindow = controller
+            controller.reload()
+            NSApp.activate(ignoringOtherApps: true)
+            controller.showWindow(nil)
+            controller.window?.makeKeyAndOrderFront(nil)
+            controller.window?.orderFrontRegardless()
+            controller.window?.makeFirstResponder(nil)
+        }
+    }
+
+    private func locationsChanged() {
+        Self.claudeSubscriptionCache = nil
+        refreshDesktopStatus()
+        refresh()
+        scheduleAuthRefresh()
+    }
 
     @objc private func openRepo() {
         menu.cancelTracking()
@@ -3324,13 +3378,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func toggleGateway(_ kind: GatewayKind) {
-        let nowOn = !gatewayEnabled(kind)
-        setGatewayEnabled(kind, nowOn)
+        setGateway(kind, on: !gatewayEnabled(kind))
+    }
+
+    private func setGateway(_ kind: GatewayKind, on: Bool) {
+        setGatewayEnabled(kind, on)
+        applyGatewayChange(kind, on: on)
+    }
+
+    private func applyGatewayChange(_ kind: GatewayKind, on nowOn: Bool) {
         if nowOn {
+            appliedGateways.insert(kind)
             // Turning a source on kicks off a fetch — mark it activating so the
             // menu shows a spinner for it until the data lands.
             activating.insert(kind)
         } else {
+            appliedGateways.remove(kind)
             activating.remove(kind)
             // Disabling a source removes ALL of its providers: drop it from the
             // live list AND its cached copy so nothing linked to it lingers.
@@ -3461,6 +3524,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = ["-lc", "exec \"$0\" \"$@\"", path] + args
+        process.environment = helperEnvironment()
         process.standardOutput = output.pipe
         process.standardError = errors.pipe
         let done = DispatchSemaphore(value: 0)
@@ -3484,6 +3548,88 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             throw NSError(domain: "ProviderQuotaMenuBar", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: message])
         }
         return outputData
+    }
+
+    struct Location {
+        let key: String
+        let label: String
+        let environmentVariable: String
+        let isFile: Bool
+        let help: String
+        let slug: String?
+    }
+
+    static let locations: [Location] = [
+        Location(key: "hermes", label: "Hermes", environmentVariable: "PROVIDER_QUOTAS_HERMES_HOME", isFile: false,
+                 help: "Hermes home: Hermes Desktop's gateway connection and sign-in, and pets.", slug: nil),
+        Location(key: "claude", label: "Claude", environmentVariable: "PROVIDER_QUOTAS_CLAUDE_HOME", isFile: false,
+                 help: "Claude Code folder: its login, sessions and plan.", slug: "anthropic"),
+        Location(key: "codex", label: "Codex", environmentVariable: "PROVIDER_QUOTAS_CODEX_HOME", isFile: false,
+                 help: "Codex home: auth.json and sessions.", slug: "openai-codex"),
+        Location(key: "opencode", label: "opencode", environmentVariable: "PROVIDER_QUOTAS_OPENCODE_HOME", isFile: false,
+                 help: "opencode data folder: auth.json and sessions.", slug: "opencode"),
+        Location(key: "antigravity", label: "Antigravity", environmentVariable: "PROVIDER_QUOTAS_ANTIGRAVITY_HOME", isFile: false,
+                 help: "Antigravity CLI folder: its sign-in token.", slug: "antigravity"),
+        Location(key: "openrouter", label: "OpenRouter", environmentVariable: "PROVIDER_QUOTAS_OPENROUTER_ENV", isFile: true,
+                 help: "A file with OPENROUTER_API_KEY=… (by default the Hermes home's .env).", slug: "openrouter"),
+    ]
+
+    static let settingsChangedNotification = "io.github.gabrielahn.provider-quotas.settings"
+
+    static func locationSettingKey(_ key: String) -> String {
+        "location.\(key)"
+    }
+
+    static func location(_ key: String) -> (url: URL, origin: String, custom: Bool) {
+        resolveLocation(key, setting: { UserDefaults.standard.string(forKey: "location.\($0)") },
+                        environment: ProcessInfo.processInfo.environment, home: URL(fileURLWithPath: NSHomeDirectory()))
+    }
+
+    static func resolveLocation(_ key: String, setting: (String) -> String?, environment: [String: String],
+                                home: URL) -> (url: URL, origin: String, custom: Bool) {
+        func path(_ value: String?) -> URL? {
+            let trimmed = (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : URL(fileURLWithPath: (trimmed as NSString).expandingTildeInPath).standardizedFileURL
+        }
+        func hermesRoot(_ url: URL) -> URL {
+            let parent = url.deletingLastPathComponent()
+            return parent.lastPathComponent.lowercased() == "profiles" ? parent.deletingLastPathComponent() : url
+        }
+        if let url = path(setting(key)) {
+            return (key == "hermes" ? hermesRoot(url) : url, "custom", true)
+        }
+        switch key {
+        case "hermes":
+            return path(environment["HERMES_HOME"]).map { (hermesRoot($0), "HERMES_HOME", false) }
+                ?? (home.appendingPathComponent(".hermes"), "default", false)
+        case "claude":
+            return path(environment["CLAUDE_CONFIG_DIR"]).map { ($0, "CLAUDE_CONFIG_DIR", false) }
+                ?? (home.appendingPathComponent(".claude"), "default", false)
+        case "codex":
+            return path(environment["CODEX_HOME"]).map { ($0, "CODEX_HOME", false) }
+                ?? (home.appendingPathComponent(".codex"), "default", false)
+        case "opencode":
+            return path(environment["XDG_DATA_HOME"]).map { ($0.appendingPathComponent("opencode"), "XDG_DATA_HOME", false) }
+                ?? (home.appendingPathComponent(".local/share/opencode"), "default", false)
+        case "antigravity":
+            return (home.appendingPathComponent(".gemini/antigravity-cli"), "default", false)
+        default:
+            let hermes = resolveLocation("hermes", setting: setting, environment: environment, home: home)
+            return (hermes.url.appendingPathComponent(".env"), "Hermes home", false)
+        }
+    }
+
+    static func helperEnvironment() -> [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        for entry in locations {
+            let resolved = location(entry.key)
+            if resolved.custom || entry.key == "hermes" {
+                environment[entry.environmentVariable] = resolved.url.path
+            } else {
+                environment.removeValue(forKey: entry.environmentVariable)
+            }
+        }
+        return environment
     }
 
     // Rebuild the floating pets: ONE pet per enabled source (Hermes / Local) whose
@@ -3930,7 +4076,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let nonSession: Set<String> = ["login", "logout", "mcp", "config", "doctor",
                                        "update", "upgrade", "install", "migrate-installer",
                                        "--version", "-v", "--help", "-h"]
-        let projects = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
+        let projects = location("claude").url.appendingPathComponent("projects")
         let dirs = (try? FileManager.default.contentsOfDirectory(at: projects, includingPropertiesForKeys: nil)) ?? []
         // id -> its transcript (nil until resolved). Deduped by id so the same
         // session found via a flag AND via lsof isn't counted twice.
@@ -3963,7 +4109,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         // Headless sessions: the id is the transcript the process holds open.
-        for url in openClaudeTranscripts(pids: headlessPIDs) {
+        for url in openClaudeTranscripts(pids: headlessPIDs, projects: projects) {
             let id = url.deletingPathExtension().lastPathComponent
             if transcriptByID[id] == nil { transcriptByID[id] = url }
         }
@@ -3986,11 +4132,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    // Transcripts (~/.claude/projects/**/<id>.jsonl) currently held OPEN by the
+    // Transcripts (<Claude folder>/projects/**/<id>.jsonl) currently held OPEN by the
     // given pids — one lsof call resolves a headless `claude` session's id without
     // a command-line flag. Empty pids → no call.
-    private static func openClaudeTranscripts(pids: [Int32]) -> [URL] {
+    private static func openClaudeTranscripts(pids: [Int32], projects: URL) -> [URL] {
         guard !pids.isEmpty else { return [] }
+        let prefixes = Set([projects.path, projects.resolvingSymlinksInPath().path].map { $0 + "/" })
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
         proc.arguments = ["-nP", "-Fn", "-p", pids.map(String.init).joined(separator: ",")]
@@ -4005,7 +4152,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var seen = Set<String>()
         for line in text.split(separator: "\n") where line.hasPrefix("n") {
             let path = String(line.dropFirst())
-            guard path.contains("/.claude/projects/"), path.hasSuffix(".jsonl") else { continue }
+            guard prefixes.contains(where: { path.hasPrefix($0) }), path.hasSuffix(".jsonl") else { continue }
             if seen.insert(path).inserted { urls.append(URL(fileURLWithPath: path)) }
         }
         return urls
@@ -4018,7 +4165,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // folder — scan the last several days, not just today/yesterday, or a
     // long-running session goes invisible.
     private static func codexSessions(now: Date) -> [LocalSession] {
-        let base = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions")
+        let base = location("codex").url.appendingPathComponent("sessions")
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy/MM/dd"
         let hex = providerHex("openai-codex")
@@ -4064,8 +4211,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // runs don't multiply dots. Fail-open everywhere: an absent store, a busy
     // writer lock, or an unreadable WAL simply yields no dots for this tick.
     private static func opencodeSessions(now: Date) -> [LocalSession] {
-        let path = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".local/share/opencode/opencode.db").path
+        let path = location("opencode").url.appendingPathComponent("opencode.db").path
         guard FileManager.default.fileExists(atPath: path) else { return [] }
         var db: OpaquePointer?
         guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, db != nil else {
@@ -4189,6 +4335,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.updateStatusItem()
                 self.rebuildMenu()
                 self.updateActivityPets()
+                if self.settingsWindow?.window?.isVisible == true {
+                    self.settingsWindow?.reload()
+                }
             }
         }
     }
@@ -4244,13 +4393,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let profile = values["hermes-desktop-active-profile-v1"]
         let provider = values["hermes.desktop.composer.provider"]
         let model = values["hermes.desktop.composer.model"]
+        let store = location("hermes").url
+        let registry = store.appendingPathComponent("gateway-connections.json")
+        let tokenStore = FileManager.default.fileExists(atPath: registry.path) ? store : nil
 
         // Adopt the gateway the Hermes source reads, from the Desktop's own config —
         // a configured remote connection in the v2 connections.json (the one it is
         // on, then its primary, then any) wins over "This device"; only a registry
         // with no gateway reads the local backend; the legacy connection.json is the
         // last fallback — exactly like the quota helper.
-        if let data = try? Data(contentsOf: support.appendingPathComponent("connections.json")),
+        if let data = try? Data(contentsOf: tokenStore == nil ? support.appendingPathComponent("connections.json") : registry),
            let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let active = gatewayConnection(in: root) {
             if (active["kind"] as? String) == "local" {
@@ -4258,7 +4410,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             let remoteURL = active["url"] as? String
             let authMode = (active["authMode"] as? String) ?? "oauth"
-            let signedIn = remoteURL.map { hasNativeOAuthSession(for: $0, support: support) } ?? false
+            let signedIn = remoteURL.map { nativeOAuthSession(for: $0, support: support, store: tokenStore) != nil } ?? false
             let reachable = remoteURL.map { gatewayIsReachable($0) } ?? false
             return DesktopStatus(running: running, mode: "remote", authMode: authMode, remoteURL: remoteURL, signedIn: signedIn, reachable: reachable, profile: profile, provider: provider, model: model)
         }
@@ -4283,7 +4435,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if mode == "ssh" {
             signedIn = block["host"] as? String != nil
         } else if authMode == "oauth" {
-            signedIn = remoteURL.map { hasNativeOAuthSession(for: $0, support: support) } ?? false
+            signedIn = remoteURL.map { nativeOAuthSession(for: $0, support: support, store: tokenStore) != nil } ?? false
         } else {
             let token = block["token"] as? [String: Any]
             signedIn = !(token?["value"] as? String ?? "").isEmpty
@@ -4339,12 +4491,159 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return result
     }
 
-    private static func hasNativeOAuthSession(for remoteURL: String, support: URL) -> Bool {
-        let tokenURL = support.appendingPathComponent("native-oauth-tokens.json")
-        guard let data = try? Data(contentsOf: tokenURL),
-              let tokens = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
-        let normalized = remoteURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        return tokens.keys.contains { $0.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == normalized }
+    static func gatewayURLKey(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let parts = URLComponents(string: trimmed) else { return trimmed }
+        var path = parts.percentEncodedPath
+        while path.hasSuffix("/") { path.removeLast() }
+        let host = (parts.percentEncodedHost ?? "").lowercased() + (parts.port.map { ":\($0)" } ?? "")
+        return "\((parts.scheme ?? "").lowercased())://\(host)\(path)"
+    }
+
+    static func nativeOAuthSession(for remoteURL: String, support: URL, store: URL?) -> [String: Any]? {
+        let key = gatewayURLKey(remoteURL)
+        let file = store?.appendingPathComponent("gateway-connection-tokens.json") ?? support.appendingPathComponent("native-oauth-tokens.json")
+        guard let data = try? Data(contentsOf: file),
+              let tokens = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        func entry(in section: Any?) -> [String: Any]? {
+            ((section as? [String: Any]) ?? [:]).first { gatewayURLKey($0.key) == key }?.value as? [String: Any]
+        }
+        guard store != nil else { return entry(in: tokens) }
+        let bound = ((tokens["tokens"] as? [String: Any]) ?? [:]).values.compactMap { $0 as? [String: Any] }
+        return bound.first { gatewayURLKey(($0["baseUrl"] as? String) ?? "") == key }
+            ?? entry(in: tokens["unbound"]) ?? entry(in: tokens["undecrypted"])
+    }
+
+    static func claudeKeychainServices(_ folder: URL, home: URL) -> [String] {
+        let base = "Claude Code-credentials"
+        let path = folder.path.precomposedStringWithCanonicalMapping
+        let hashed = [path, path + "/"].map { text -> String in
+            let digest = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+            return base + "-" + String(digest.prefix(8))
+        }
+        return folder.path == home.appendingPathComponent(".claude").path ? [base, hashed[0]] : hashed
+    }
+
+    static func keychainItemExists(service: String, account: String?) -> Bool {
+        var query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                    kSecAttrService as String: service,
+                                    kSecMatchLimit as String: kSecMatchLimitOne,
+                                    kSecReturnAttributes as String: true]
+        if let account {
+            query[kSecAttrAccount as String] = account
+        }
+        var item: CFTypeRef?
+        return SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess
+    }
+
+    static func envFileHasKey(_ file: URL, name: String) -> Bool {
+        guard let text = try? String(contentsOf: file, encoding: .utf8) else { return false }
+        for raw in text.components(separatedBy: .newlines) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard line.hasPrefix(name + "="), !line.hasPrefix("#") else { continue }
+            let value = String(line.dropFirst(name.count + 1)).trimmingCharacters(in: .whitespaces)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\"")).trimmingCharacters(in: CharacterSet(charactersIn: "'"))
+            if !value.isEmpty, value != "CHANGEME" {
+                return true
+            }
+        }
+        return false
+    }
+
+    static func locationStatus(_ key: String, url: URL, custom: Bool, environment: [String: String], home: URL,
+                               support: URL, keychain: (String, String?) -> Bool) -> (state: String, text: String) {
+        let fm = FileManager.default
+        var isDirectory: ObjCBool = false
+        let exists = fm.fileExists(atPath: url.path, isDirectory: &isDirectory)
+        let folder = exists && isDirectory.boolValue
+        func json(_ name: String) -> [String: Any]? {
+            guard let data = try? Data(contentsOf: url.appendingPathComponent(name)) else { return nil }
+            return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        }
+        func filled(_ value: Any?) -> Bool {
+            !((value as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        if key == "openrouter" {
+            if !custom, filled(environment["OPENROUTER_API_KEY"]) {
+                return ("ok", "Using OPENROUTER_API_KEY from the environment.")
+            }
+            if envFileHasKey(url, name: "OPENROUTER_API_KEY") {
+                return ("ok", "OPENROUTER_API_KEY found.")
+            }
+            if !custom {
+                return ("info", "No OPENROUTER_API_KEY found.")
+            }
+            return ("warn", exists && !folder ? "No OPENROUTER_API_KEY in this file." : "This file doesn't exist.")
+        }
+        if custom && !folder {
+            return ("warn", "This folder doesn't exist.")
+        }
+        let unset = ("info", "Not set up on this Mac.")
+        switch key {
+        case "hermes":
+            guard folder else { return unset }
+            let status = hermesHomeStatus(url, support: support)
+            return (status.ok ? "ok" : "warn", status.text)
+        case "claude":
+            if let service = claudeKeychainServices(url, home: home).first(where: { keychain($0, nil) }) {
+                return ("ok", "Signed in (Keychain: \(service)).")
+            }
+            if filled((json(".credentials.json")?["claudeAiOauth"] as? [String: Any])?["accessToken"]) {
+                return ("ok", "Signed in (.credentials.json).")
+            }
+            return folder ? ("warn", "No Claude Code login here. Run claude and sign in.") : unset
+        case "codex":
+            if fm.fileExists(atPath: url.appendingPathComponent("auth.json").path) {
+                return ("ok", "Signed in (auth.json).")
+            }
+            if !custom, fm.fileExists(atPath: home.appendingPathComponent(".config/goose/chatgpt_codex/tokens.json").path) {
+                return ("ok", "Signed in (Goose).")
+            }
+            return folder ? ("warn", "No auth.json here. Run codex login.") : unset
+        case "opencode":
+            if filled((json("auth.json")?["openrouter"] as? [String: Any])?["key"]) {
+                return ("ok", "Signed in (auth.json).")
+            }
+            return folder ? ("info", "Not signed in. Run opencode auth login.") : unset
+        default:
+            if fm.fileExists(atPath: url.appendingPathComponent("antigravity-oauth-token").path) {
+                return ("ok", "Signed in (antigravity-oauth-token).")
+            }
+            if !custom, keychain("gemini", "antigravity") {
+                return ("ok", "Signed in (Keychain).")
+            }
+            return folder ? ("info", "Not signed in. Run agy to sign in.") : unset
+        }
+    }
+
+    static func hermesHomeStatus(_ home: URL, support: URL) -> (ok: Bool, text: String) {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: home.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            return (false, "This folder doesn't exist.")
+        }
+        let registry = home.appendingPathComponent("gateway-connections.json")
+        let migrated = FileManager.default.fileExists(atPath: registry.path)
+        let older = migrated ? "" : " (older Hermes Desktop files)"
+        guard let data = try? Data(contentsOf: migrated ? registry : support.appendingPathComponent("connections.json")),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let active = gatewayConnection(in: root) else {
+            return (false, "No Hermes Desktop connection found here.")
+        }
+        guard (active["kind"] as? String) != "local", let url = active["url"] as? String, !url.isEmpty else {
+            return (true, "Hermes Desktop uses This device\(older).")
+        }
+        let name = gatewayURLKey(url).components(separatedBy: "://").last ?? url
+        guard let session = nativeOAuthSession(for: url, support: support, store: migrated ? home : nil) else {
+            return (false, "\(name): not signed in. Sign in from Hermes Desktop\(older).")
+        }
+        let plain = (session["encoding"] as? String) == "plain" ? (session["value"] as? String).flatMap {
+            try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any]
+        } : nil
+        if let expires = ((plain ?? session)["expiresAt"] as? NSNumber)?.doubleValue,
+           (expires > 1e12 ? expires / 1000 : expires) < Date().timeIntervalSince1970 {
+            return (false, "\(name): sign-in expired. Open Hermes Desktop to renew it\(older).")
+        }
+        return (true, "\(name): signed in\(older).")
     }
 
     private static func gatewayIsReachable(_ remoteURL: String) -> Bool {
@@ -4371,14 +4670,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func openHermes() {
-        NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: NSHomeDirectory() + "/Applications/Hermes.app"), configuration: NSWorkspace.OpenConfiguration())
+        guard let app = gatewayAppURL() else { return }
+        NSWorkspace.shared.openApplication(at: app, configuration: NSWorkspace.OpenConfiguration())
     }
 
-    // The Hermes app to launch / sign into ("local" has no app).
+    // The Hermes app to launch / sign into ("local" has no app): the running copy,
+    // else wherever Launch Services knows it, else the usual install folders.
     private func gatewayAppURL() -> URL? {
-        let hermes = URL(fileURLWithPath: NSHomeDirectory() + "/Applications/Hermes.app")
-        return FileManager.default.fileExists(atPath: hermes.path) ? hermes
-            : NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.nousresearch.hermes")
+        let bundleID = "com.nousresearch.hermes"
+        if let running = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first?.bundleURL {
+            return running
+        }
+        return NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
+            ?? [URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Applications/Hermes.app"),
+                URL(fileURLWithPath: "/Applications/Hermes.app")].first { FileManager.default.fileExists(atPath: $0.path) }
     }
 
     // Sources are configured by the user, per source — nothing is hardcoded or
@@ -4412,13 +4717,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let raw = sender.identifier?.rawValue else { return }
         let parts = raw.split(separator: ":", maxSplits: 1).map(String.init)
         guard parts.count == 2, let kind = GatewayKind(rawValue: parts[0]) else { return }
-        setProviderShownInMenuBar(kind, parts[1], !providerShownInMenuBar(kind, parts[1]))
+        setProviderShown(kind, parts[1], !providerShownInMenuBar(kind, parts[1]))
+    }
+
+    private func setProviderShown(_ kind: GatewayKind, _ slug: String, _ shown: Bool) {
+        setProviderShownInMenuBar(kind, slug, shown)
         updateStatusItem()
         rebuildMenu()
         // Reflect the change in the pet IMMEDIATELY — rebuild from the cached
         // sessions (Hermes hexes + last local scan) with the new hidden filter, so
         // a hidden provider's dots vanish on click, not on the next 1s poll.
         activityPanel.show(buildSourcePetTiles(localSessions: lastLocalSessions))
+        if settingsWindow?.window?.isVisible == true {
+            settingsWindow?.reload()
+        }
+    }
+
+    private func settingsModel() -> SettingsModel {
+        SettingsModel(
+            sourceEnabled: { [weak self] raw in
+                guard let self, let kind = GatewayKind(rawValue: raw) else { return false }
+                return self.gatewayEnabled(kind)
+            },
+            setSourceEnabled: { [weak self] raw, on in
+                guard let self, let kind = GatewayKind(rawValue: raw), self.gatewayEnabled(kind) != on else { return }
+                self.setGateway(kind, on: on)
+            },
+            providers: { [weak self] raw in
+                guard let self, let kind = GatewayKind(rawValue: raw) else { return [] }
+                let live = self.sources.first { $0.kind == kind }?.providers.map { (slug: $0.provider, label: $0.label) } ?? []
+                return live.isEmpty ? (self.lastProvidersByKind[raw] ?? []) : live
+            },
+            providerShown: { [weak self] raw, slug in
+                guard let self, let kind = GatewayKind(rawValue: raw) else { return true }
+                return self.providerShownInMenuBar(kind, slug)
+            },
+            setProviderShown: { [weak self] raw, slug, shown in
+                guard let self, let kind = GatewayKind(rawValue: raw) else { return }
+                self.setProviderShown(kind, slug, shown)
+            },
+            locationsChanged: { [weak self] in
+                self?.locationsChanged()
+            },
+            theme: { [weak self] in
+                self?.settingsTheme() ?? SettingsTheme(appearance: nil, primary: .labelColor, secondary: .secondaryLabelColor,
+                                                       tertiary: .tertiaryLabelColor, brand: { _ in .hermesBlue })
+            })
+    }
+
+    private func settingsTheme() -> SettingsTheme {
+        SettingsTheme(appearance: themedAppearance(), primary: menuPrimaryColor(), secondary: menuSecondaryColor(),
+                      tertiary: menuTertiaryColor(), brand: { [weak self] slug in self?.providerBrandColor(slug) ?? .hermesBlue })
+    }
+
+    private func settingsChangedExternally() {
+        for kind in Self.sourceOrder where gatewayEnabled(kind) != appliedGateways.contains(kind) {
+            applyGatewayChange(kind, on: gatewayEnabled(kind))
+        }
+        updateStatusItem()
+        rebuildMenu()
+        activityPanel.show(buildSourcePetTiles(localSessions: lastLocalSessions))
+        settingsWindow?.reload()
+        locationsChanged()
     }
 
     @objc private func openGateway() {
@@ -4496,6 +4856,709 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func quit() {
         NSApplication.shared.terminate(nil)
+    }
+}
+
+struct SettingsTheme {
+    let appearance: NSAppearance?
+    let primary: NSColor
+    let secondary: NSColor
+    let tertiary: NSColor
+    let brand: (String) -> NSColor
+}
+
+struct SettingsModel {
+    let sourceEnabled: (String) -> Bool
+    let setSourceEnabled: (String, Bool) -> Void
+    let providers: (String) -> [(slug: String, label: String)]
+    let providerShown: (String, String) -> Bool
+    let setProviderShown: (String, String, Bool) -> Void
+    let locationsChanged: () -> Void
+    let theme: () -> SettingsTheme
+}
+
+final class ThemedToggle: NSView {
+    private(set) var isOn = false
+    var tint: NSColor = .hermesBlue
+    var onChange: ((ThemedToggle) -> Void)?
+    @objc dynamic var knob: CGFloat = 0 {
+        didSet { needsDisplay = true }
+    }
+    private var hoverArea: NSTrackingArea?
+    private var hovering = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.masksToBounds = false
+        updateGlow()
+    }
+
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    override var intrinsicContentSize: NSSize { NSSize(width: 32, height: 18) }
+
+    override static func defaultAnimation(forKey key: NSAnimatablePropertyKey) -> Any? {
+        key == "knob" ? CABasicAnimation() : super.defaultAnimation(forKey: key)
+    }
+
+    func setOn(_ on: Bool, animated: Bool = false) {
+        isOn = on
+        if animated {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.16
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                animator().knob = on ? 1 : 0
+            }
+        } else {
+            knob = on ? 1 : 0
+        }
+        updateGlow()
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let track = bounds.insetBy(dx: 1, dy: 1)
+        let radius = track.height / 2
+        let grey = NSColor.secondaryLabelColor.usingColorSpace(.sRGB) ?? .gray
+        let off = grey.withAlphaComponent(0.3)
+        let on = tint.usingColorSpace(.sRGB) ?? tint
+        let shape = NSBezierPath(roundedRect: track.insetBy(dx: 0.5, dy: 0.5), xRadius: radius - 0.5, yRadius: radius - 0.5)
+        (off.blended(withFraction: knob, of: on) ?? (isOn ? on : off)).setFill()
+        shape.fill()
+        grey.withAlphaComponent(0.45 * (1 - knob)).setStroke()
+        shape.lineWidth = 1
+        shape.stroke()
+        let size = track.height - 4
+        let knobRect = NSRect(x: track.minX + 2 + (track.width - 4 - size) * knob, y: track.minY + 2, width: size, height: size)
+        NSGraphicsContext.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.35)
+        shadow.shadowBlurRadius = 1.5
+        shadow.shadowOffset = NSSize(width: 0, height: -0.5)
+        shadow.set()
+        NSColor.white.setFill()
+        NSBezierPath(ovalIn: knobRect).fill()
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    private func flip() {
+        setOn(!isOn, animated: true)
+        onChange?(self)
+        NSAccessibility.post(element: self, notification: .valueChanged)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        flip()
+    }
+
+    override var acceptsFirstResponder: Bool { NSApp.isFullKeyboardAccessEnabled }
+
+    override func keyDown(with event: NSEvent) {
+        if event.charactersIgnoringModifiers == " " {
+            flip()
+        } else {
+            super.keyDown(with: event)
+        }
+    }
+
+    override func drawFocusRingMask() {
+        let track = bounds.insetBy(dx: 1, dy: 1)
+        NSBezierPath(roundedRect: track, xRadius: track.height / 2, yRadius: track.height / 2).fill()
+    }
+
+    override var focusRingMaskBounds: NSRect { bounds }
+
+    override func updateTrackingAreas() {
+        if let hoverArea {
+            removeTrackingArea(hoverArea)
+        }
+        let area = NSTrackingArea(rect: bounds, options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited], owner: self)
+        addTrackingArea(area)
+        hoverArea = area
+        super.updateTrackingAreas()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hovering = true
+        updateGlow()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hovering = false
+        updateGlow()
+    }
+
+    private func updateGlow() {
+        guard let layer else { return }
+        layer.shadowColor = tint.cgColor
+        layer.shadowOffset = .zero
+        layer.shadowRadius = hovering ? 7 : 4
+        layer.shadowOpacity = hovering ? (isOn ? 0.9 : 0.4) : (isOn ? 0.35 : 0)
+    }
+
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityRole() -> NSAccessibility.Role? { .checkBox }
+    override func accessibilitySubrole() -> NSAccessibility.Subrole? { .switch }
+    override func accessibilityValue() -> Any? { NSNumber(value: isOn ? 1 : 0) }
+    override func accessibilityPerformPress() -> Bool {
+        flip()
+        return true
+    }
+}
+
+final class SettingsWindowController: NSWindowController, NSWindowDelegate {
+    private final class FlippedView: NSView {
+        var appearanceChanged: (() -> Void)?
+        override var isFlipped: Bool { true }
+        override func viewDidChangeEffectiveAppearance() {
+            super.viewDidChangeEffectiveAppearance()
+            appearanceChanged?()
+        }
+    }
+
+    private struct Row {
+        let location: AppDelegate.Location
+        let url: URL
+        let origin: String
+        let custom: Bool
+        let state: String
+        let text: String
+        let shown: Bool
+    }
+
+    private struct Snapshot {
+        let hermesOn: Bool
+        let hermes: Row
+        let providers: [(slug: String, label: String, shown: Bool)]
+        let localOn: Bool
+        let present: [Row]
+        let missing: [AppDelegate.Location]
+
+        var shape: String {
+            ([String(hermesOn), String(localOn)]
+             + providers.map { "\($0.slug)=\($0.label)=\($0.shown)" }
+             + present.map { "\($0.location.key)=\($0.shown)" }
+             + ["missing"] + missing.map { $0.key }).joined(separator: "|")
+        }
+    }
+
+    private struct Controls {
+        let mode: NSSegmentedControl
+        let path: NSTextField
+        let icon: NSImageView
+        let status: NSTextField
+        let top: CGFloat
+    }
+
+    private enum Column {
+        static let inset: CGFloat = 20
+        static let toggle: CGFloat = 36
+        static let name: CGFloat = 76
+        static let mode: CGFloat = 164
+        static let path: CGFloat = 322
+        static let choose: CGFloat = 540
+    }
+
+    private static let width: CGFloat = 640
+    private let model: SettingsModel
+    private static let cornerRadius: CGFloat = 16
+    private let glass = SettingsWindowController.makeGlass()
+    private var theme: SettingsTheme
+    private var controls: [String: Controls] = [:]
+    private var dots: [String: NSImageView] = [:]
+    private var missing: [AppDelegate.Location] = []
+    private var shape: String?
+    private var renderedAppearance: NSAppearance.Name?
+    private var rendering = false
+
+    init(model: SettingsModel) {
+        self.model = model
+        theme = model.theme()
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: Self.width, height: 320),
+                              styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
+        window.title = "Provider Quotas Settings"
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.isMovableByWindowBackground = true
+        window.isReleasedWhenClosed = false
+        window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.appearance = theme.appearance
+        window.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        window.standardWindowButton(.zoomButton)?.isHidden = true
+        window.contentView = glass
+        super.init(window: window)
+        window.delegate = self
+        reload()
+        window.center()
+    }
+
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        reload()
+    }
+
+    private static func makeGlass() -> NSView {
+#if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            let glass = NSGlassEffectView()
+            glass.style = .regular
+            glass.cornerRadius = cornerRadius
+            return glass
+        }
+#endif
+        let effect = NSVisualEffectView()
+        effect.material = .menu
+        effect.blendingMode = .behindWindow
+        effect.state = .active
+        return effect
+    }
+
+    private func setContent(_ view: NSView) {
+#if compiler(>=6.2)
+        if #available(macOS 26.0, *), let glass = glass as? NSGlassEffectView {
+            glass.contentView = view
+            return
+        }
+#endif
+        glass.subviews = [view]
+    }
+
+    func applyTheme() {
+        theme = model.theme()
+        window?.appearance = theme.appearance
+        shape = nil
+        reload()
+    }
+
+    func reload() {
+        guard !rendering else { return }
+        let snapshot = takeSnapshot()
+        if snapshot.shape != shape {
+            shape = snapshot.shape
+            render(snapshot)
+        }
+        update(snapshot)
+    }
+
+    static func list(_ names: [String]) -> String {
+        guard let last = names.last, names.count > 1 else { return names.first ?? "" }
+        return names.dropLast().joined(separator: ", ") + " and " + last
+    }
+
+    private func takeSnapshot() -> Snapshot {
+        let environment = ProcessInfo.processInfo.environment
+        let home = URL(fileURLWithPath: NSHomeDirectory())
+        let support = home.appendingPathComponent("Library/Application Support/Hermes")
+        let rows = AppDelegate.locations.map { location -> Row in
+            let resolved = AppDelegate.location(location.key)
+            let status = AppDelegate.locationStatus(location.key, url: resolved.url, custom: resolved.custom,
+                                                    environment: environment, home: home, support: support) {
+                AppDelegate.keychainItemExists(service: $0, account: $1)
+            }
+            let shown = location.slug.map { model.providerShown("local", $0) } ?? true
+            return Row(location: location, url: resolved.url, origin: resolved.origin, custom: resolved.custom,
+                       state: status.state, text: status.text, shown: shown)
+        }
+        let local = rows.filter { $0.location.key != "hermes" }
+        let present = local.filter { $0.custom || $0.state != "info" }
+        let missing = local.filter { row in !present.contains { $0.location.key == row.location.key } }
+        let providers = model.providers("hermes").map {
+            (slug: $0.slug, label: $0.label, shown: model.providerShown("hermes", $0.slug))
+        }
+        return Snapshot(hermesOn: model.sourceEnabled("hermes"), hermes: rows.first { $0.location.key == "hermes" } ?? rows[0],
+                        providers: providers, localOn: model.sourceEnabled("local"), present: present,
+                        missing: missing.map { $0.location })
+    }
+
+    private func render(_ snapshot: Snapshot) {
+        guard let window else { return }
+        rendering = true
+        defer { rendering = false }
+        theme = model.theme()
+        let width = Self.width
+        let view = FlippedView(frame: NSRect(x: 0, y: 0, width: width, height: 10))
+        controls = [:]
+        dots = [:]
+        missing = snapshot.missing
+        func place(_ subview: NSView, _ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat) {
+            subview.frame = NSRect(x: x, y: y, width: w, height: h)
+            view.addSubview(subview)
+        }
+        var y: CGFloat = 34
+        place(label("Settings", size: 15, weight: .semibold), Column.inset, y, 300, 20)
+        let gauge = NSImageView()
+        gauge.image = NSImage(systemSymbolName: "gauge.with.dots.needle.50percent", accessibilityDescription: nil)
+        gauge.contentTintColor = .hermesBlue
+        place(gauge, width - Column.inset - 22, y - 1, 22, 22)
+        y += 24
+        place(wrapping("Switch a provider off to hide its activity from the menu bar and the pet. Providers that aren't set up on this Mac stay out of this list until you add them."),
+              Column.inset, y, width - 2 * Column.inset, 30)
+        y += 46
+
+        y = header(view, y, source: "hermes", title: "Hermes", on: snapshot.hermesOn, offText: "Off")
+        if snapshot.hermesOn {
+            y = locationLine(view, y, snapshot.hermes, toggle: false)
+            if snapshot.providers.isEmpty {
+                place(label("Its providers appear here once Hermes connects.", color: theme.secondary),
+                      Column.name, y + 2, width - Column.name - Column.inset, 16)
+                y += 26
+            } else {
+                let column = Column.path - Column.toggle
+                for (index, provider) in snapshot.providers.enumerated() {
+                    let shift = CGFloat(index % 2) * column
+                    let top = y + CGFloat(index / 2) * 26
+                    let toggle = providerToggle("hermes", provider.slug, "\(provider.label) from Hermes", on: provider.shown)
+                    place(toggle, Column.toggle + shift, top + 1, 32, 18)
+                    place(label(provider.label, size: 12, weight: .semibold,
+                                color: provider.shown ? theme.brand(provider.slug) : theme.secondary),
+                          Column.name + shift, top + 2, column - (Column.name - Column.toggle) - 8, 16)
+                }
+                y += CGFloat((snapshot.providers.count + 1) / 2) * 26
+            }
+        }
+        y += 14
+
+        let found = snapshot.present.map { $0.location.label }
+        y = header(view, y, source: "local", title: "This Mac", on: snapshot.localOn,
+                   offText: found.isEmpty ? "Off" : "Off · \(Self.list(found)) found on this Mac")
+        if snapshot.localOn {
+            for row in snapshot.present {
+                y = row.shown ? locationLine(view, y, row, toggle: true) : offLine(view, y, row)
+            }
+            if snapshot.present.isEmpty {
+                place(label("No providers found on this Mac yet.", color: theme.secondary),
+                      Column.name, y + 2, width - Column.name - Column.inset, 16)
+                y += 26
+            }
+            if !snapshot.missing.isEmpty {
+                let add = chip("Add Provider", symbol: "plus", action: #selector(showAddProvider(_:)))
+                add.setAccessibilityLabel("Add Provider")
+                let addWidth: CGFloat = 112
+                place(add, width - Column.inset - addWidth, y + 3, addWidth, 20)
+                let note = label("Not set up on this Mac: \(Self.list(snapshot.missing.map { $0.label }))", color: theme.secondary)
+                note.lineBreakMode = .byTruncatingTail
+                place(note, Column.toggle, y + 5, width - Column.toggle - addWidth - Column.inset - 12, 16)
+                y += 32
+            }
+        }
+        y += 18
+
+        let lead = label("Also from Terminal:", size: 10.5, color: theme.secondary)
+        place(lead, Column.inset, y + 1, 104, 15)
+        let command = label("provider-quotas config [<provider> <path> | --automatic | --on | --off]", color: theme.secondary)
+        command.font = .monospacedSystemFont(ofSize: 10.5, weight: .regular)
+        command.isSelectable = true
+        place(command, Column.inset + 108, y, width - Column.inset * 2 - 108, 16)
+        y += 38
+
+        let top = window.frame.maxY
+        let visible = window.isVisible
+        window.setContentSize(NSSize(width: width, height: y))
+        view.frame = NSRect(x: 0, y: 0, width: width, height: y)
+        view.autoresizingMask = [.width, .height]
+        setContent(view)
+        renderedAppearance = window.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua])
+        view.appearanceChanged = { [weak self, weak window] in
+            guard let self, let window, !self.rendering else { return }
+            let now = window.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua])
+            if now != self.renderedAppearance {
+                self.applyTheme()
+            }
+        }
+        if visible {
+            var frame = window.frame
+            frame.origin.y = top - frame.height
+            window.setFrame(frame, display: true)
+        }
+    }
+
+    private func header(_ view: NSView, _ y: CGFloat, source: String, title: String, on: Bool, offText: String) -> CGFloat {
+        let mark = NSImageView(frame: NSRect(x: Column.inset, y: y + 9, width: 9, height: 9))
+        mark.imageScaling = .scaleProportionallyDown
+        view.addSubview(mark)
+        dots[source] = mark
+        let name = label(title.uppercased(), size: 10, weight: .semibold, color: theme.secondary)
+        name.frame = NSRect(x: Column.inset + 15, y: y + 7, width: 90, height: 14)
+        view.addSubview(name)
+        if !on {
+            let text = label(offText, color: theme.secondary)
+            text.frame = NSRect(x: Column.mode, y: y + 6, width: Self.width - Column.mode - Column.inset - 44, height: 16)
+            text.lineBreakMode = .byTruncatingTail
+            text.setAccessibilityLabel("\(title) status")
+            view.addSubview(text)
+        }
+        let toggle = ThemedToggle(frame: NSRect(x: Self.width - Column.inset - 32, y: y + 5, width: 32, height: 18))
+        toggle.setOn(on)
+        toggle.identifier = NSUserInterfaceItemIdentifier(source)
+        toggle.setAccessibilityLabel("Read \(title)")
+        toggle.onChange = { [weak self] control in
+            guard let self, let source = control.identifier?.rawValue else { return }
+            self.model.setSourceEnabled(source, control.isOn)
+            self.refreshSoon()
+        }
+        view.addSubview(toggle)
+        return y + 32
+    }
+
+    private func locationLine(_ view: NSView, _ y: CGFloat, _ row: Row, toggle: Bool) -> CGFloat {
+        let location = row.location
+        let kind = location.isFile ? "file" : "folder"
+        if toggle, let slug = location.slug {
+            let control = providerToggle("local", slug, "\(location.label) from this Mac", on: true)
+            control.frame = NSRect(x: Column.toggle, y: y + 3, width: 32, height: 18)
+            view.addSubview(control)
+        }
+        let title = toggle
+            ? label(location.label, size: 12, weight: .semibold, color: location.slug.map { theme.brand($0) } ?? theme.primary)
+            : label("Home", size: 12, color: theme.secondary)
+        let titleX = toggle ? Column.name : Column.toggle
+        title.frame = NSRect(x: titleX, y: y + 4, width: Column.mode - titleX - 6, height: 17)
+        title.toolTip = location.help
+        view.addSubview(title)
+        let mode = NSSegmentedControl(labels: ["Automatic", "Custom"], trackingMode: .selectOne,
+                                      target: self, action: #selector(modeChanged(_:)))
+        mode.controlSize = .small
+        mode.font = .systemFont(ofSize: 11)
+        mode.selectedSegmentBezelColor = .hermesBlue
+        mode.frame = NSRect(x: Column.mode, y: y + 2, width: 150, height: 20)
+        mode.identifier = NSUserInterfaceItemIdentifier(location.key)
+        mode.toolTip = location.help
+        mode.setAccessibilityLabel("\(location.label) location")
+        view.addSubview(mode)
+        let path = NSTextField(string: "")
+        path.frame = NSRect(x: Column.path, y: y + 1, width: Column.choose - Column.path - 8, height: 22)
+        path.bezelStyle = .roundedBezel
+        path.font = .systemFont(ofSize: 11)
+        path.usesSingleLineMode = true
+        path.cell?.isScrollable = true
+        path.cell?.sendsActionOnEndEditing = true
+        path.target = self
+        path.action = #selector(pathEdited(_:))
+        path.identifier = NSUserInterfaceItemIdentifier(location.key)
+        path.setAccessibilityLabel("\(location.label) \(kind)")
+        view.addSubview(path)
+        let chooseButton = chip("Choose…", symbol: nil, action: #selector(chooseLocation(_:)))
+        chooseButton.frame = NSRect(x: Column.choose, y: y + 2, width: Self.width - Column.inset - Column.choose, height: 20)
+        chooseButton.identifier = NSUserInterfaceItemIdentifier(location.key)
+        chooseButton.setAccessibilityLabel("Choose \(location.label) \(kind)")
+        view.addSubview(chooseButton)
+        let icon = NSImageView(frame: NSRect(x: Column.mode + 1, y: y + 31, width: 13, height: 13))
+        let status = NSTextField(wrappingLabelWithString: "")
+        status.font = .systemFont(ofSize: 11)
+        status.frame = NSRect(x: Column.mode + 18, y: y + 30, width: Self.width - Column.mode - 18 - Column.inset, height: 30)
+        status.setAccessibilityLabel("\(location.label) status")
+        view.addSubview(icon)
+        view.addSubview(status)
+        controls[location.key] = Controls(mode: mode, path: path, icon: icon, status: status, top: y)
+        return y + 64
+    }
+
+    private func offLine(_ view: NSView, _ y: CGFloat, _ row: Row) -> CGFloat {
+        let location = row.location
+        if let slug = location.slug {
+            let control = providerToggle("local", slug, "\(location.label) from this Mac", on: false)
+            control.frame = NSRect(x: Column.toggle, y: y + 1, width: 32, height: 18)
+            view.addSubview(control)
+        }
+        let title = label(location.label, size: 12, weight: .semibold, color: theme.secondary)
+        title.frame = NSRect(x: Column.name, y: y + 2, width: Column.mode - Column.name - 6, height: 17)
+        view.addSubview(title)
+        let note = label("Off · hidden from the menu bar and the pet", color: theme.secondary)
+        note.frame = NSRect(x: Column.mode, y: y + 3, width: Self.width - Column.mode - Column.inset, height: 16)
+        note.setAccessibilityLabel("\(location.label) status")
+        view.addSubview(note)
+        return y + 28
+    }
+
+    private func providerToggle(_ source: String, _ slug: String, _ name: String, on: Bool) -> ThemedToggle {
+        let toggle = ThemedToggle(frame: NSRect(x: 0, y: 0, width: 32, height: 18))
+        toggle.setOn(on)
+        toggle.identifier = NSUserInterfaceItemIdentifier("\(source):\(slug)")
+        toggle.setAccessibilityLabel("Show \(name)")
+        toggle.onChange = { [weak self] control in
+            let parts = (control.identifier?.rawValue ?? "").split(separator: ":", maxSplits: 1).map(String.init)
+            guard let self, parts.count == 2 else { return }
+            self.model.setProviderShown(parts[0], parts[1], control.isOn)
+            self.refreshSoon()
+        }
+        return toggle
+    }
+
+    private func chip(_ title: String, symbol: String?, action: Selector) -> HoverGlowButton {
+        let button = HoverGlowButton(title: title, target: self, action: action)
+        button.glowColor = .hermesBlue
+        button.attributedTitle = NSAttributedString(string: title, attributes: [
+            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: theme.primary,
+        ])
+        if let symbol {
+            button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 10, weight: .semibold))
+            button.imagePosition = .imageLeading
+            button.imageHugsTitle = true
+            button.contentTintColor = .hermesBlue
+        }
+        return button
+    }
+
+    func addProviderMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.appearance = theme.appearance
+        for location in missing {
+            let item = NSMenuItem(title: "\(location.label)…", action: #selector(addProviderItem(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = location.key
+            if let slug = location.slug {
+                let style = NSImage.SymbolConfiguration(pointSize: 8, weight: .regular)
+                    .applying(.init(paletteColors: [theme.brand(slug)]))
+                item.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: nil)?
+                    .withSymbolConfiguration(style)
+            }
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    private func label(_ text: String, size: CGFloat = 11, weight: NSFont.Weight = .regular,
+                       color: NSColor? = nil) -> NSTextField {
+        let field = NSTextField(labelWithString: text)
+        field.font = .systemFont(ofSize: size, weight: weight)
+        field.textColor = color ?? theme.primary
+        return field
+    }
+
+    private func wrapping(_ text: String) -> NSTextField {
+        let field = NSTextField(wrappingLabelWithString: text)
+        field.font = .systemFont(ofSize: 11)
+        field.textColor = theme.secondary
+        return field
+    }
+
+    private func update(_ snapshot: Snapshot) {
+        let localWarn = snapshot.present.contains { $0.shown && $0.state == "warn" }
+        setDot("hermes", on: snapshot.hermesOn, color: snapshot.hermes.state == "ok" ? .hermesGreen : .hermesRed)
+        setDot("local", on: snapshot.localOn,
+               color: localWarn ? .hermesYellow : snapshot.present.contains { $0.shown } ? .hermesGreen : theme.tertiary)
+        let editing = (window?.firstResponder as? NSText)?.delegate as? NSTextField
+        for row in [snapshot.hermes] + snapshot.present {
+            guard let control = controls[row.location.key] else { continue }
+            control.mode.selectedSegment = row.custom ? 1 : 0
+            if editing !== control.path {
+                control.path.stringValue = (row.url.path as NSString).abbreviatingWithTildeInPath
+            }
+            control.path.isEditable = row.custom
+            control.path.isSelectable = true
+            control.path.isBezeled = row.custom
+            control.path.drawsBackground = row.custom
+            control.path.textColor = row.custom ? theme.primary : theme.secondary
+            control.path.frame.origin.y = row.custom ? control.top + 1 : control.top + 5
+            control.path.frame.size.height = row.custom ? 22 : 16
+            control.path.toolTip = row.custom ? "Custom \(row.location.isFile ? "file" : "folder")"
+                : row.origin == "default" ? "Automatic" : "Automatic, from \(row.origin)"
+            show(row, icon: control.icon, text: control.status)
+        }
+    }
+
+    private func setDot(_ source: String, on: Bool, color: NSColor) {
+        guard let mark = dots[source] else { return }
+        mark.image = NSImage(systemSymbolName: on ? "circle.fill" : "circle", accessibilityDescription: nil)
+        mark.contentTintColor = on ? color : theme.tertiary
+    }
+
+    private func show(_ row: Row, icon: NSImageView, text: NSTextField) {
+        let symbol = ["ok": "checkmark.circle.fill", "warn": "exclamationmark.triangle.fill"][row.state] ?? "minus.circle"
+        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: row.state)
+        icon.contentTintColor = ["ok": NSColor.hermesGreen, "warn": NSColor.hermesYellow][row.state] ?? theme.tertiary
+        let from = !row.custom && row.origin != "default" && row.origin != "Hermes home" ? " From \(row.origin)." : ""
+        text.stringValue = row.text + from
+        text.textColor = row.state == "info" ? theme.secondary : theme.primary
+    }
+
+    @objc private func modeChanged(_ sender: NSSegmentedControl) {
+        guard let key = sender.identifier?.rawValue else { return }
+        if sender.selectedSegment == 0 {
+            _ = controls[key]?.path.abortEditing()
+            save(key, nil)
+            refreshSoon()
+        } else {
+            save(key, AppDelegate.location(key).url.path)
+            refreshSoon(focus: key)
+        }
+    }
+
+    @objc private func pathEdited(_ sender: NSTextField) {
+        guard !rendering, let key = sender.identifier?.rawValue, AppDelegate.location(key).custom else { return }
+        save(key, sender.stringValue)
+        refreshSoon()
+    }
+
+    @objc private func chooseLocation(_ sender: NSButton) {
+        guard let key = sender.identifier?.rawValue else { return }
+        choose(key)
+    }
+
+    @objc private func showAddProvider(_ sender: NSButton) {
+        addProviderMenu().popUp(positioning: nil, at: NSPoint(x: 0, y: sender.isFlipped ? sender.bounds.maxY + 4 : -4), in: sender)
+    }
+
+    @objc private func addProviderItem(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String else { return }
+        choose(key)
+    }
+
+    private func choose(_ key: String) {
+        guard let window, let location = AppDelegate.locations.first(where: { $0.key == key }) else { return }
+        let current = AppDelegate.location(key).url
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = !location.isFile
+        panel.canChooseFiles = location.isFile
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.showsHiddenFiles = true
+        panel.treatsFilePackagesAsDirectories = true
+        panel.prompt = location.isFile ? "Use File" : "Use Folder"
+        panel.message = "\(location.label): \(location.help)"
+        panel.directoryURL = location.isFile ? current.deletingLastPathComponent() : current
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard let self, response == .OK, let url = panel.url else { return }
+            if let slug = location.slug, !self.model.providerShown("local", slug) {
+                self.model.setProviderShown("local", slug, true)
+            }
+            self.save(key, url.path)
+            self.refreshSoon()
+        }
+    }
+
+    private func save(_ key: String, _ value: String?) {
+        let setting = AppDelegate.locationSettingKey(key)
+        let trimmed = (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let next = trimmed.isEmpty ? nil : URL(fileURLWithPath: (trimmed as NSString).expandingTildeInPath).standardizedFileURL.path
+        let previous = UserDefaults.standard.string(forKey: setting)
+        if let next {
+            UserDefaults.standard.set(next, forKey: setting)
+        } else {
+            UserDefaults.standard.removeObject(forKey: setting)
+        }
+        if next != previous {
+            model.locationsChanged()
+        }
+    }
+
+    private func refreshSoon(focus key: String? = nil) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.reload()
+            if let key, let field = self.controls[key]?.path {
+                self.window?.makeFirstResponder(field)
+            }
+        }
     }
 }
 
