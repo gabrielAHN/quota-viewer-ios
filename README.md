@@ -63,7 +63,8 @@ source off stops reading it, and its section shrinks to one line naming what was
 found. Providers that aren't set up on this Mac stay out of the list.
 **Add Provider** names them and adds one from a folder (or, for OpenRouter, a key
 file) you choose. A provider you sign in to later, in its standard location,
-appears on its own.
+appears on its own. Settings follows the menu's theme: the theme button switches
+both between System, Light and Dark.
 
 Each location starts as **Automatic**, so most installs never change anything:
 

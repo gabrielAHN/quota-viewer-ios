@@ -2664,6 +2664,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenu()
         applyMenuWindowAppearance()   // retheme the open dropdown live
         updateActivityPets()
+        settingsWindow?.applyTheme()
     }
 
     private func actionBarView() -> NSView {
@@ -2715,6 +2716,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             controller.showWindow(nil)
             controller.window?.makeKeyAndOrderFront(nil)
             controller.window?.orderFrontRegardless()
+            controller.window?.makeFirstResponder(nil)
         }
     }
 
@@ -4756,7 +4758,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             },
             locationsChanged: { [weak self] in
                 self?.locationsChanged()
+            },
+            theme: { [weak self] in
+                self?.settingsTheme() ?? SettingsTheme(appearance: nil, primary: .labelColor, secondary: .secondaryLabelColor,
+                                                       tertiary: .tertiaryLabelColor, brand: { _ in .hermesBlue })
             })
+    }
+
+    private func settingsTheme() -> SettingsTheme {
+        SettingsTheme(appearance: themedAppearance(), primary: menuPrimaryColor(), secondary: menuSecondaryColor(),
+                      tertiary: menuTertiaryColor(), brand: { [weak self] slug in self?.providerBrandColor(slug) ?? .hermesBlue })
     }
 
     private func settingsChangedExternally() {
@@ -4848,6 +4859,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
+struct SettingsTheme {
+    let appearance: NSAppearance?
+    let primary: NSColor
+    let secondary: NSColor
+    let tertiary: NSColor
+    let brand: (String) -> NSColor
+}
+
 struct SettingsModel {
     let sourceEnabled: (String) -> Bool
     let setSourceEnabled: (String, Bool) -> Void
@@ -4855,11 +4874,148 @@ struct SettingsModel {
     let providerShown: (String, String) -> Bool
     let setProviderShown: (String, String, Bool) -> Void
     let locationsChanged: () -> Void
+    let theme: () -> SettingsTheme
+}
+
+final class ThemedToggle: NSView {
+    private(set) var isOn = false
+    var tint: NSColor = .hermesBlue
+    var onChange: ((ThemedToggle) -> Void)?
+    @objc dynamic var knob: CGFloat = 0 {
+        didSet { needsDisplay = true }
+    }
+    private var hoverArea: NSTrackingArea?
+    private var hovering = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.masksToBounds = false
+        updateGlow()
+    }
+
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    override var intrinsicContentSize: NSSize { NSSize(width: 32, height: 18) }
+
+    override static func defaultAnimation(forKey key: NSAnimatablePropertyKey) -> Any? {
+        key == "knob" ? CABasicAnimation() : super.defaultAnimation(forKey: key)
+    }
+
+    func setOn(_ on: Bool, animated: Bool = false) {
+        isOn = on
+        if animated {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.16
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                animator().knob = on ? 1 : 0
+            }
+        } else {
+            knob = on ? 1 : 0
+        }
+        updateGlow()
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let track = bounds.insetBy(dx: 1, dy: 1)
+        let radius = track.height / 2
+        let grey = NSColor.secondaryLabelColor.usingColorSpace(.sRGB) ?? .gray
+        let off = grey.withAlphaComponent(0.3)
+        let on = tint.usingColorSpace(.sRGB) ?? tint
+        let shape = NSBezierPath(roundedRect: track.insetBy(dx: 0.5, dy: 0.5), xRadius: radius - 0.5, yRadius: radius - 0.5)
+        (off.blended(withFraction: knob, of: on) ?? (isOn ? on : off)).setFill()
+        shape.fill()
+        grey.withAlphaComponent(0.45 * (1 - knob)).setStroke()
+        shape.lineWidth = 1
+        shape.stroke()
+        let size = track.height - 4
+        let knobRect = NSRect(x: track.minX + 2 + (track.width - 4 - size) * knob, y: track.minY + 2, width: size, height: size)
+        NSGraphicsContext.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.35)
+        shadow.shadowBlurRadius = 1.5
+        shadow.shadowOffset = NSSize(width: 0, height: -0.5)
+        shadow.set()
+        NSColor.white.setFill()
+        NSBezierPath(ovalIn: knobRect).fill()
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    private func flip() {
+        setOn(!isOn, animated: true)
+        onChange?(self)
+        NSAccessibility.post(element: self, notification: .valueChanged)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        flip()
+    }
+
+    override var acceptsFirstResponder: Bool { NSApp.isFullKeyboardAccessEnabled }
+
+    override func keyDown(with event: NSEvent) {
+        if event.charactersIgnoringModifiers == " " {
+            flip()
+        } else {
+            super.keyDown(with: event)
+        }
+    }
+
+    override func drawFocusRingMask() {
+        let track = bounds.insetBy(dx: 1, dy: 1)
+        NSBezierPath(roundedRect: track, xRadius: track.height / 2, yRadius: track.height / 2).fill()
+    }
+
+    override var focusRingMaskBounds: NSRect { bounds }
+
+    override func updateTrackingAreas() {
+        if let hoverArea {
+            removeTrackingArea(hoverArea)
+        }
+        let area = NSTrackingArea(rect: bounds, options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited], owner: self)
+        addTrackingArea(area)
+        hoverArea = area
+        super.updateTrackingAreas()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hovering = true
+        updateGlow()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hovering = false
+        updateGlow()
+    }
+
+    private func updateGlow() {
+        guard let layer else { return }
+        layer.shadowColor = tint.cgColor
+        layer.shadowOffset = .zero
+        layer.shadowRadius = hovering ? 7 : 4
+        layer.shadowOpacity = hovering ? (isOn ? 0.9 : 0.4) : (isOn ? 0.35 : 0)
+    }
+
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityRole() -> NSAccessibility.Role? { .checkBox }
+    override func accessibilitySubrole() -> NSAccessibility.Subrole? { .switch }
+    override func accessibilityValue() -> Any? { NSNumber(value: isOn ? 1 : 0) }
+    override func accessibilityPerformPress() -> Bool {
+        flip()
+        return true
+    }
 }
 
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private final class FlippedView: NSView {
+        var appearanceChanged: (() -> Void)?
         override var isFlipped: Bool { true }
+        override func viewDidChangeEffectiveAppearance() {
+            super.viewDidChangeEffectiveAppearance()
+            appearanceChanged?()
+        }
     }
 
     private struct Row {
@@ -4889,25 +5045,51 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private struct Controls {
-        let mode: NSPopUpButton
+        let mode: NSSegmentedControl
         let path: NSTextField
-        let icon: NSImageView?
-        let status: NSTextField?
+        let icon: NSImageView
+        let status: NSTextField
+        let top: CGFloat
     }
 
-    private static let width: CGFloat = 660
+    private enum Column {
+        static let inset: CGFloat = 20
+        static let toggle: CGFloat = 36
+        static let name: CGFloat = 76
+        static let mode: CGFloat = 164
+        static let path: CGFloat = 322
+        static let choose: CGFloat = 540
+    }
+
+    private static let width: CGFloat = 640
     private let model: SettingsModel
+    private static let cornerRadius: CGFloat = 16
+    private let glass = SettingsWindowController.makeGlass()
+    private var theme: SettingsTheme
     private var controls: [String: Controls] = [:]
+    private var dots: [String: NSImageView] = [:]
+    private var missing: [AppDelegate.Location] = []
     private var shape: String?
+    private var renderedAppearance: NSAppearance.Name?
     private var rendering = false
 
     init(model: SettingsModel) {
         self.model = model
+        theme = model.theme()
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: Self.width, height: 320),
-                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
+                              styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
         window.title = "Provider Quotas Settings"
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.isMovableByWindowBackground = true
         window.isReleasedWhenClosed = false
         window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.appearance = theme.appearance
+        window.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        window.standardWindowButton(.zoomButton)?.isHidden = true
+        window.contentView = glass
         super.init(window: window)
         window.delegate = self
         reload()
@@ -4919,6 +5101,39 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowDidBecomeKey(_ notification: Notification) {
+        reload()
+    }
+
+    private static func makeGlass() -> NSView {
+#if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            let glass = NSGlassEffectView()
+            glass.style = .regular
+            glass.cornerRadius = cornerRadius
+            return glass
+        }
+#endif
+        let effect = NSVisualEffectView()
+        effect.material = .menu
+        effect.blendingMode = .behindWindow
+        effect.state = .active
+        return effect
+    }
+
+    private func setContent(_ view: NSView) {
+#if compiler(>=6.2)
+        if #available(macOS 26.0, *), let glass = glass as? NSGlassEffectView {
+            glass.contentView = view
+            return
+        }
+#endif
+        glass.subviews = [view]
+    }
+
+    func applyTheme() {
+        theme = model.theme()
+        window?.appearance = theme.appearance
+        shape = nil
         reload()
     }
 
@@ -4962,100 +5177,101 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                         missing: missing.map { $0.location })
     }
 
-    private enum Column {
-        static let sectionSwitch: CGFloat = 21
-        static let rowSwitch: CGFloat = 84
-        static let label: CGFloat = 140
-        static let popup: CGFloat = 216
-        static let path: CGFloat = 332
-        static let choose: CGFloat = 542
-    }
-
     private func render(_ snapshot: Snapshot) {
         guard let window else { return }
         rendering = true
         defer { rendering = false }
+        theme = model.theme()
         let width = Self.width
         let view = FlippedView(frame: NSRect(x: 0, y: 0, width: width, height: 10))
         controls = [:]
+        dots = [:]
+        missing = snapshot.missing
         func place(_ subview: NSView, _ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat) {
             subview.frame = NSRect(x: x, y: y, width: w, height: h)
             view.addSubview(subview)
         }
-        var y: CGFloat = 18
-        place(label("Providers", size: 13, weight: .semibold), 20, y, width - 40, 17)
-        y += 21
-        place(wrapping("Switch a provider off to hide its activity from the menu bar and the pet. Providers that aren't set up on this Mac stay out of this list until you add them."), 20, y, width - 40, 30)
-        y += 44
+        var y: CGFloat = 34
+        place(label("Settings", size: 15, weight: .semibold), Column.inset, y, 300, 20)
+        let gauge = NSImageView()
+        gauge.image = NSImage(systemSymbolName: "gauge.with.dots.needle.50percent", accessibilityDescription: nil)
+        gauge.contentTintColor = .hermesBlue
+        place(gauge, width - Column.inset - 22, y - 1, 22, 22)
+        y += 24
+        place(wrapping("Switch a provider off to hide its activity from the menu bar and the pet. Providers that aren't set up on this Mac stay out of this list until you add them."),
+              Column.inset, y, width - 2 * Column.inset, 30)
+        y += 46
 
         y = header(view, y, source: "hermes", title: "Hermes", on: snapshot.hermesOn, offText: "Off")
         if snapshot.hermesOn {
-            y = locationLine(view, y, snapshot.hermes, name: "Home", toggle: false)
+            y = locationLine(view, y, snapshot.hermes, toggle: false)
             if snapshot.providers.isEmpty {
-                place(label("Its providers appear here once Hermes connects.", color: .secondaryLabelColor),
-                      Column.label, y + 2, width - Column.label - 22, 16)
+                place(label("Its providers appear here once Hermes connects.", color: theme.secondary),
+                      Column.name, y + 2, width - Column.name - Column.inset, 16)
                 y += 26
             } else {
+                let column = Column.path - Column.toggle
                 for (index, provider) in snapshot.providers.enumerated() {
-                    let shift = CGFloat(index % 2) * (Column.path - Column.rowSwitch)
+                    let shift = CGFloat(index % 2) * column
                     let top = y + CGFloat(index / 2) * 26
-                    let control = providerSwitch("hermes", provider.slug, "\(provider.label) from Hermes", on: provider.shown)
-                    let size = control.fittingSize
-                    place(control, Column.rowSwitch + shift, top + (20 - size.height) / 2, size.width, size.height)
-                    place(label(provider.label, size: 12, color: provider.shown ? .labelColor : .secondaryLabelColor),
-                          Column.label + shift, top + 2, Column.path - Column.label - 8, 16)
+                    let toggle = providerToggle("hermes", provider.slug, "\(provider.label) from Hermes", on: provider.shown)
+                    place(toggle, Column.toggle + shift, top + 1, 32, 18)
+                    place(label(provider.label, size: 12, weight: .semibold,
+                                color: provider.shown ? theme.brand(provider.slug) : theme.secondary),
+                          Column.name + shift, top + 2, column - (Column.name - Column.toggle) - 8, 16)
                 }
                 y += CGFloat((snapshot.providers.count + 1) / 2) * 26
             }
         }
-        y += 12
+        y += 14
 
         let found = snapshot.present.map { $0.location.label }
         y = header(view, y, source: "local", title: "This Mac", on: snapshot.localOn,
                    offText: found.isEmpty ? "Off" : "Off · \(Self.list(found)) found on this Mac")
         if snapshot.localOn {
             for row in snapshot.present {
-                y = row.shown ? locationLine(view, y, row, name: row.location.label, toggle: true) : offLine(view, y, row)
+                y = row.shown ? locationLine(view, y, row, toggle: true) : offLine(view, y, row)
             }
             if snapshot.present.isEmpty {
-                place(label("No providers found on this Mac yet.", color: .secondaryLabelColor),
-                      Column.label, y + 2, width - Column.label - 22, 16)
+                place(label("No providers found on this Mac yet.", color: theme.secondary),
+                      Column.name, y + 2, width - Column.name - Column.inset, 16)
                 y += 26
             }
             if !snapshot.missing.isEmpty {
-                let add = NSPopUpButton(frame: .zero, pullsDown: true)
-                add.addItem(withTitle: "Add Provider")
-                for location in snapshot.missing {
-                    add.addItem(withTitle: "\(location.label)…")
-                    add.lastItem?.representedObject = location.key
-                }
-                add.target = self
-                add.action = #selector(addProvider(_:))
+                let add = chip("Add Provider", symbol: "plus", action: #selector(showAddProvider(_:)))
                 add.setAccessibilityLabel("Add Provider")
-                add.sizeToFit()
-                let addWidth = add.frame.width
-                place(add, Column.choose + 96 - addWidth, y + 2, addWidth, 25)
-                let note = label("Not set up on this Mac: \(Self.list(snapshot.missing.map { $0.label }))", color: .secondaryLabelColor)
+                let addWidth: CGFloat = 112
+                place(add, width - Column.inset - addWidth, y + 3, addWidth, 20)
+                let note = label("Not set up on this Mac: \(Self.list(snapshot.missing.map { $0.label }))", color: theme.secondary)
                 note.lineBreakMode = .byTruncatingTail
-                place(note, Column.label, y + 7, width - Column.label - addWidth - 32, 16)
-                y += 34
+                place(note, Column.toggle, y + 5, width - Column.toggle - addWidth - Column.inset - 12, 16)
+                y += 32
             }
         }
-        y += 14
+        y += 18
 
-        let lead = label("Also from Terminal:", color: .secondaryLabelColor)
-        place(lead, 20, y + 1, 116, 16)
-        let command = label("provider-quotas config [<provider> <path> | --automatic | --on | --off]", color: .secondaryLabelColor)
+        let lead = label("Also from Terminal:", size: 10.5, color: theme.secondary)
+        place(lead, Column.inset, y + 1, 104, 15)
+        let command = label("provider-quotas config [<provider> <path> | --automatic | --on | --off]", color: theme.secondary)
         command.font = .monospacedSystemFont(ofSize: 10.5, weight: .regular)
         command.isSelectable = true
-        place(command, Column.label, y, width - Column.label - 22, 16)
+        place(command, Column.inset + 108, y, width - Column.inset * 2 - 108, 16)
         y += 38
 
-        view.frame = NSRect(x: 0, y: 0, width: width, height: y)
         let top = window.frame.maxY
         let visible = window.isVisible
-        window.contentView = view
         window.setContentSize(NSSize(width: width, height: y))
+        view.frame = NSRect(x: 0, y: 0, width: width, height: y)
+        view.autoresizingMask = [.width, .height]
+        setContent(view)
+        renderedAppearance = window.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua])
+        view.appearanceChanged = { [weak self, weak window] in
+            guard let self, let window, !self.rendering else { return }
+            let now = window.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua])
+            if now != self.renderedAppearance {
+                self.applyTheme()
+            }
+        }
         if visible {
             var frame = window.frame
             frame.origin.y = top - frame.height
@@ -5064,51 +5280,62 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func header(_ view: NSView, _ y: CGFloat, source: String, title: String, on: Bool, offText: String) -> CGFloat {
-        let control = NSSwitch()
-        control.state = on ? .on : .off
-        control.target = self
-        control.action = #selector(sourceToggled(_:))
-        control.identifier = NSUserInterfaceItemIdentifier(source)
-        control.setAccessibilityLabel("Read \(title)")
-        let size = control.fittingSize
-        control.frame = NSRect(x: Column.sectionSwitch, y: y + (26 - size.height) / 2, width: size.width, height: size.height)
-        view.addSubview(control)
-        let name = label(title, size: 13, weight: .semibold)
-        name.frame = NSRect(x: max(Column.rowSwitch, control.frame.maxX + 10), y: y + 4, width: 110, height: 18)
+        let mark = NSImageView(frame: NSRect(x: Column.inset, y: y + 9, width: 9, height: 9))
+        mark.imageScaling = .scaleProportionallyDown
+        view.addSubview(mark)
+        dots[source] = mark
+        let name = label(title.uppercased(), size: 10, weight: .semibold, color: theme.secondary)
+        name.frame = NSRect(x: Column.inset + 15, y: y + 7, width: 90, height: 14)
         view.addSubview(name)
         if !on {
-            let text = label(offText, color: .secondaryLabelColor)
-            text.frame = NSRect(x: Column.popup, y: y + 5, width: Self.width - Column.popup - 22, height: 16)
+            let text = label(offText, color: theme.secondary)
+            text.frame = NSRect(x: Column.mode, y: y + 6, width: Self.width - Column.mode - Column.inset - 44, height: 16)
             text.lineBreakMode = .byTruncatingTail
             text.setAccessibilityLabel("\(title) status")
             view.addSubview(text)
         }
-        return y + 34
+        let toggle = ThemedToggle(frame: NSRect(x: Self.width - Column.inset - 32, y: y + 5, width: 32, height: 18))
+        toggle.setOn(on)
+        toggle.identifier = NSUserInterfaceItemIdentifier(source)
+        toggle.setAccessibilityLabel("Read \(title)")
+        toggle.onChange = { [weak self] control in
+            guard let self, let source = control.identifier?.rawValue else { return }
+            self.model.setSourceEnabled(source, control.isOn)
+            self.refreshSoon()
+        }
+        view.addSubview(toggle)
+        return y + 32
     }
 
-    private func locationLine(_ view: NSView, _ y: CGFloat, _ row: Row, name: String, toggle: Bool) -> CGFloat {
+    private func locationLine(_ view: NSView, _ y: CGFloat, _ row: Row, toggle: Bool) -> CGFloat {
         let location = row.location
         let kind = location.isFile ? "file" : "folder"
         if toggle, let slug = location.slug {
-            let control = providerSwitch("local", slug, "\(location.label) from this Mac", on: true)
-            let size = control.fittingSize
-            control.frame = NSRect(x: Column.rowSwitch, y: y + (24 - size.height) / 2, width: size.width, height: size.height)
+            let control = providerToggle("local", slug, "\(location.label) from this Mac", on: true)
+            control.frame = NSRect(x: Column.toggle, y: y + 3, width: 32, height: 18)
             view.addSubview(control)
         }
-        let title = label(name, size: 12, color: toggle ? .labelColor : .secondaryLabelColor)
-        title.frame = NSRect(x: Column.label, y: y + 4, width: Column.popup - Column.label - 4, height: 17)
+        let title = toggle
+            ? label(location.label, size: 12, weight: .semibold, color: location.slug.map { theme.brand($0) } ?? theme.primary)
+            : label("Home", size: 12, color: theme.secondary)
+        let titleX = toggle ? Column.name : Column.toggle
+        title.frame = NSRect(x: titleX, y: y + 4, width: Column.mode - titleX - 6, height: 17)
         title.toolTip = location.help
         view.addSubview(title)
-        let mode = NSPopUpButton(frame: NSRect(x: Column.popup, y: y, width: 110, height: 25), pullsDown: false)
-        mode.addItems(withTitles: ["Automatic", "Custom"])
-        mode.target = self
-        mode.action = #selector(modeChanged(_:))
+        let mode = NSSegmentedControl(labels: ["Automatic", "Custom"], trackingMode: .selectOne,
+                                      target: self, action: #selector(modeChanged(_:)))
+        mode.controlSize = .small
+        mode.font = .systemFont(ofSize: 11)
+        mode.selectedSegmentBezelColor = .hermesBlue
+        mode.frame = NSRect(x: Column.mode, y: y + 2, width: 150, height: 20)
         mode.identifier = NSUserInterfaceItemIdentifier(location.key)
         mode.toolTip = location.help
         mode.setAccessibilityLabel("\(location.label) location")
         view.addSubview(mode)
         let path = NSTextField(string: "")
-        path.frame = NSRect(x: Column.path, y: y + 1, width: Column.choose - Column.path - 6, height: 22)
+        path.frame = NSRect(x: Column.path, y: y + 1, width: Column.choose - Column.path - 8, height: 22)
+        path.bezelStyle = .roundedBezel
+        path.font = .systemFont(ofSize: 11)
         path.usesSingleLineMode = true
         path.cell?.isScrollable = true
         path.cell?.sendsActionOnEndEditing = true
@@ -5117,108 +5344,146 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         path.identifier = NSUserInterfaceItemIdentifier(location.key)
         path.setAccessibilityLabel("\(location.label) \(kind)")
         view.addSubview(path)
-        let chooseButton = NSButton(title: "Choose…", target: self, action: #selector(chooseLocation(_:)))
-        chooseButton.frame = NSRect(x: Column.choose, y: y - 4, width: 96, height: 32)
+        let chooseButton = chip("Choose…", symbol: nil, action: #selector(chooseLocation(_:)))
+        chooseButton.frame = NSRect(x: Column.choose, y: y + 2, width: Self.width - Column.inset - Column.choose, height: 20)
         chooseButton.identifier = NSUserInterfaceItemIdentifier(location.key)
         chooseButton.setAccessibilityLabel("Choose \(location.label) \(kind)")
         view.addSubview(chooseButton)
-        let icon = NSImageView(frame: NSRect(x: Column.path, y: y + 31, width: 14, height: 14))
+        let icon = NSImageView(frame: NSRect(x: Column.mode + 1, y: y + 31, width: 13, height: 13))
         let status = NSTextField(wrappingLabelWithString: "")
         status.font = .systemFont(ofSize: 11)
-        status.frame = NSRect(x: Column.path + 19, y: y + 30, width: Self.width - Column.path - 41, height: 30)
+        status.frame = NSRect(x: Column.mode + 18, y: y + 30, width: Self.width - Column.mode - 18 - Column.inset, height: 30)
         status.setAccessibilityLabel("\(location.label) status")
         view.addSubview(icon)
         view.addSubview(status)
-        controls[location.key] = Controls(mode: mode, path: path, icon: icon, status: status)
+        controls[location.key] = Controls(mode: mode, path: path, icon: icon, status: status, top: y)
         return y + 64
     }
 
     private func offLine(_ view: NSView, _ y: CGFloat, _ row: Row) -> CGFloat {
         let location = row.location
         if let slug = location.slug {
-            let control = providerSwitch("local", slug, "\(location.label) from this Mac", on: false)
-            let size = control.fittingSize
-            control.frame = NSRect(x: Column.rowSwitch, y: y + (20 - size.height) / 2, width: size.width, height: size.height)
+            let control = providerToggle("local", slug, "\(location.label) from this Mac", on: false)
+            control.frame = NSRect(x: Column.toggle, y: y + 1, width: 32, height: 18)
             view.addSubview(control)
         }
-        let title = label(location.label, size: 12, color: .secondaryLabelColor)
-        title.frame = NSRect(x: Column.label, y: y + 2, width: Column.popup - Column.label - 4, height: 17)
+        let title = label(location.label, size: 12, weight: .semibold, color: theme.secondary)
+        title.frame = NSRect(x: Column.name, y: y + 2, width: Column.mode - Column.name - 6, height: 17)
         view.addSubview(title)
-        let note = label("Off · hidden from the menu bar and the pet", color: .secondaryLabelColor)
-        note.frame = NSRect(x: Column.popup, y: y + 3, width: Self.width - Column.popup - 22, height: 16)
+        let note = label("Off · hidden from the menu bar and the pet", color: theme.secondary)
+        note.frame = NSRect(x: Column.mode, y: y + 3, width: Self.width - Column.mode - Column.inset, height: 16)
         note.setAccessibilityLabel("\(location.label) status")
         view.addSubview(note)
         return y + 28
     }
 
-    private func providerSwitch(_ source: String, _ slug: String, _ name: String, on: Bool) -> NSSwitch {
-        let control = NSSwitch()
-        control.controlSize = .small
-        control.state = on ? .on : .off
-        control.target = self
-        control.action = #selector(providerToggled(_:))
-        control.identifier = NSUserInterfaceItemIdentifier("\(source):\(slug)")
-        control.setAccessibilityLabel("Show \(name)")
-        return control
+    private func providerToggle(_ source: String, _ slug: String, _ name: String, on: Bool) -> ThemedToggle {
+        let toggle = ThemedToggle(frame: NSRect(x: 0, y: 0, width: 32, height: 18))
+        toggle.setOn(on)
+        toggle.identifier = NSUserInterfaceItemIdentifier("\(source):\(slug)")
+        toggle.setAccessibilityLabel("Show \(name)")
+        toggle.onChange = { [weak self] control in
+            let parts = (control.identifier?.rawValue ?? "").split(separator: ":", maxSplits: 1).map(String.init)
+            guard let self, parts.count == 2 else { return }
+            self.model.setProviderShown(parts[0], parts[1], control.isOn)
+            self.refreshSoon()
+        }
+        return toggle
+    }
+
+    private func chip(_ title: String, symbol: String?, action: Selector) -> HoverGlowButton {
+        let button = HoverGlowButton(title: title, target: self, action: action)
+        button.glowColor = .hermesBlue
+        button.attributedTitle = NSAttributedString(string: title, attributes: [
+            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: theme.primary,
+        ])
+        if let symbol {
+            button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 10, weight: .semibold))
+            button.imagePosition = .imageLeading
+            button.imageHugsTitle = true
+            button.contentTintColor = .hermesBlue
+        }
+        return button
+    }
+
+    func addProviderMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.appearance = theme.appearance
+        for location in missing {
+            let item = NSMenuItem(title: "\(location.label)…", action: #selector(addProviderItem(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = location.key
+            if let slug = location.slug {
+                let style = NSImage.SymbolConfiguration(pointSize: 8, weight: .regular)
+                    .applying(.init(paletteColors: [theme.brand(slug)]))
+                item.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: nil)?
+                    .withSymbolConfiguration(style)
+            }
+            menu.addItem(item)
+        }
+        return menu
     }
 
     private func label(_ text: String, size: CGFloat = 11, weight: NSFont.Weight = .regular,
-                       color: NSColor = .labelColor) -> NSTextField {
+                       color: NSColor? = nil) -> NSTextField {
         let field = NSTextField(labelWithString: text)
         field.font = .systemFont(ofSize: size, weight: weight)
-        field.textColor = color
+        field.textColor = color ?? theme.primary
         return field
     }
 
     private func wrapping(_ text: String) -> NSTextField {
         let field = NSTextField(wrappingLabelWithString: text)
         field.font = .systemFont(ofSize: 11)
-        field.textColor = .secondaryLabelColor
+        field.textColor = theme.secondary
         return field
     }
 
     private func update(_ snapshot: Snapshot) {
+        let localWarn = snapshot.present.contains { $0.shown && $0.state == "warn" }
+        setDot("hermes", on: snapshot.hermesOn, color: snapshot.hermes.state == "ok" ? .hermesGreen : .hermesRed)
+        setDot("local", on: snapshot.localOn,
+               color: localWarn ? .hermesYellow : snapshot.present.contains { $0.shown } ? .hermesGreen : theme.tertiary)
         let editing = (window?.firstResponder as? NSText)?.delegate as? NSTextField
         for row in [snapshot.hermes] + snapshot.present {
             guard let control = controls[row.location.key] else { continue }
-            control.mode.selectItem(at: row.custom ? 1 : 0)
+            control.mode.selectedSegment = row.custom ? 1 : 0
             if editing !== control.path {
                 control.path.stringValue = (row.url.path as NSString).abbreviatingWithTildeInPath
             }
-            control.path.isEnabled = row.custom
+            control.path.isEditable = row.custom
+            control.path.isSelectable = true
+            control.path.isBezeled = row.custom
+            control.path.drawsBackground = row.custom
+            control.path.textColor = row.custom ? theme.primary : theme.secondary
+            control.path.frame.origin.y = row.custom ? control.top + 1 : control.top + 5
+            control.path.frame.size.height = row.custom ? 22 : 16
             control.path.toolTip = row.custom ? "Custom \(row.location.isFile ? "file" : "folder")"
                 : row.origin == "default" ? "Automatic" : "Automatic, from \(row.origin)"
-            if let icon = control.icon, let status = control.status {
-                show(row, icon: icon, text: status)
-            }
+            show(row, icon: control.icon, text: control.status)
         }
+    }
+
+    private func setDot(_ source: String, on: Bool, color: NSColor) {
+        guard let mark = dots[source] else { return }
+        mark.image = NSImage(systemSymbolName: on ? "circle.fill" : "circle", accessibilityDescription: nil)
+        mark.contentTintColor = on ? color : theme.tertiary
     }
 
     private func show(_ row: Row, icon: NSImageView, text: NSTextField) {
         let symbol = ["ok": "checkmark.circle.fill", "warn": "exclamationmark.triangle.fill"][row.state] ?? "minus.circle"
         icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: row.state)
-        icon.contentTintColor = ["ok": NSColor.systemGreen, "warn": NSColor.systemOrange][row.state] ?? .tertiaryLabelColor
+        icon.contentTintColor = ["ok": NSColor.hermesGreen, "warn": NSColor.hermesYellow][row.state] ?? theme.tertiary
         let from = !row.custom && row.origin != "default" && row.origin != "Hermes home" ? " From \(row.origin)." : ""
         text.stringValue = row.text + from
-        text.textColor = row.state == "info" ? .secondaryLabelColor : .labelColor
+        text.textColor = row.state == "info" ? theme.secondary : theme.primary
     }
 
-    @objc private func sourceToggled(_ sender: NSSwitch) {
-        guard let source = sender.identifier?.rawValue else { return }
-        model.setSourceEnabled(source, sender.state == .on)
-        refreshSoon()
-    }
-
-    @objc private func providerToggled(_ sender: NSSwitch) {
-        let parts = (sender.identifier?.rawValue ?? "").split(separator: ":", maxSplits: 1).map(String.init)
-        guard parts.count == 2 else { return }
-        model.setProviderShown(parts[0], parts[1], sender.state == .on)
-        refreshSoon()
-    }
-
-    @objc private func modeChanged(_ sender: NSPopUpButton) {
+    @objc private func modeChanged(_ sender: NSSegmentedControl) {
         guard let key = sender.identifier?.rawValue else { return }
-        if sender.indexOfSelectedItem == 0 {
+        if sender.selectedSegment == 0 {
             _ = controls[key]?.path.abortEditing()
             save(key, nil)
             refreshSoon()
@@ -5239,8 +5504,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         choose(key)
     }
 
-    @objc private func addProvider(_ sender: NSPopUpButton) {
-        guard let key = sender.selectedItem?.representedObject as? String else { return }
+    @objc private func showAddProvider(_ sender: NSButton) {
+        addProviderMenu().popUp(positioning: nil, at: NSPoint(x: 0, y: sender.isFlipped ? sender.bounds.maxY + 4 : -4), in: sender)
+    }
+
+    @objc private func addProviderItem(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String else { return }
         choose(key)
     }
 
